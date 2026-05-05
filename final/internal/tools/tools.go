@@ -3,7 +3,11 @@
 package tools
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -21,6 +25,7 @@ type Tool struct {
 	Name        string  `json:"name"`
 	Description string  `json:"description"`
 	Parameters  []Param `json:"parameters"`
+	IsMCP       bool    `json:"is_mcp,omitempty"` // 是否为外部 MCP 工具
 	// Execute 执行工具逻辑，params 对应 Parameters 中声明的参数
 	Execute func(params map[string]interface{}) (string, error) `json:"-"`
 }
@@ -60,6 +65,8 @@ func GetWeather() Tool {
 		"上海": "小雨 20°C",
 		"纽约": "晴天 15°C",
 		"伦敦": "阴天 12°C",
+		"广州": "晴天 28°C",
+		"深圳": "晴天 26°C",
 	}
 	return Tool{
 		Name:        "get_weather",
@@ -68,9 +75,9 @@ func GetWeather() Tool {
 		Execute: func(p map[string]interface{}) (string, error) {
 			city, _ := p["city"].(string)
 			if w, ok := db[city]; ok {
-				return w, nil
+				return fmt.Sprintf("%s：%s", city, w), nil
 			}
-			return city + ": 晴天 20°C（模拟）", nil
+			return fmt.Sprintf("%s：晴天 20°C（模拟）", city), nil
 		},
 	}
 }
@@ -97,7 +104,7 @@ func SearchWeb() Tool {
 	}
 }
 
-// DefaultTools 返回所有内置工具的映射表
+// DefaultTools 返回所有内置工具的映射表（不含 rag_search，由 agent 动态注入）
 func DefaultTools() map[string]Tool {
 	list := []Tool{GetTime(), GetWeather(), SearchWeb()}
 	m := make(map[string]Tool, len(list))
@@ -109,32 +116,73 @@ func DefaultTools() map[string]Tool {
 
 // ─────────────────────────────── 工具选择 ────────────────────────────────
 
-// Decide 基于规则从 query 中推断应调用的工具及参数（模拟 LLM function-calling）
-func Decide(query string, tools map[string]Tool) *CallResult {
+// Decide 基于规则推断应调用的工具及参数。
+// 只会返回 ts 中实际存在的工具；若规则匹配到的工具不在 ts 中则返回 nil。
+func Decide(query string, ts map[string]Tool) *CallResult {
 	q := strings.ToLower(query)
 
 	if strings.Contains(q, "几点") || strings.Contains(q, "时间") {
-		params := map[string]interface{}{}
-		if strings.Contains(q, "东京") {
-			params["timezone"] = "Asia/Tokyo"
+		if _, ok := ts["get_time"]; ok {
+			params := map[string]interface{}{}
+			if strings.Contains(q, "东京") {
+				params["timezone"] = "Asia/Tokyo"
+			}
+			return &CallResult{ToolName: "get_time", Params: params}
 		}
-		return &CallResult{ToolName: "get_time", Params: params}
 	}
 
 	if strings.Contains(q, "天气") {
-		city := "北京"
-		for _, c := range []string{"东京", "北京", "上海", "纽约", "伦敦"} {
-			if strings.Contains(q, c) {
-				city = c
-				break
+		if _, ok := ts["get_weather"]; ok {
+			city := "北京"
+			for _, c := range []string{"东京", "北京", "上海", "纽约", "伦敦", "广州", "深圳"} {
+				if strings.Contains(q, c) {
+					city = c
+					break
+				}
 			}
+			return &CallResult{ToolName: "get_weather", Params: map[string]interface{}{"city": city}}
 		}
-		return &CallResult{ToolName: "get_weather", Params: map[string]interface{}{"city": city}}
 	}
 
 	if strings.Contains(q, "查") || strings.Contains(q, "搜索") || strings.Contains(q, "是什么") {
-		return &CallResult{ToolName: "search_web", Params: map[string]interface{}{"query": query}}
+		if _, ok := ts["search_web"]; ok {
+			return &CallResult{ToolName: "search_web", Params: map[string]interface{}{"query": query}}
+		}
 	}
 
+	// 无规则命中或命中工具不在集合中时，取集合中第一个工具兜底
+	for name, _ := range ts {
+		return &CallResult{ToolName: name, Params: map[string]interface{}{"query": query}}
+	}
 	return nil
+}
+
+// NewMCPTool 创建一个调用外部 HTTP 端点的 MCP 兼容工具。
+// 请求体为 JSON 对象（params），响应体作为工具结果返回。
+func NewMCPTool(name, description, endpoint string, params []Param) Tool {
+	return Tool{
+		Name:        name,
+		Description: description,
+		Parameters:  params,
+		IsMCP:       true,
+		Execute: func(p map[string]interface{}) (string, error) {
+			body, err := json.Marshal(p)
+			if err != nil {
+				return "", fmt.Errorf("序列化参数失败: %w", err)
+			}
+			resp, err := http.Post(endpoint, "application/json", bytes.NewReader(body)) //nolint
+			if err != nil {
+				return "", fmt.Errorf("MCP 请求失败 [%s]: %w", endpoint, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				return "", fmt.Errorf("MCP 返回错误状态 %d [%s]", resp.StatusCode, endpoint)
+			}
+			data, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return "", fmt.Errorf("读取 MCP 响应失败: %w", err)
+			}
+			return string(data), nil
+		},
+	}
 }

@@ -1,6 +1,6 @@
 // Package memory 实现三层记忆系统：
 //   - ShortTerm  短期记忆：近 N 轮对话滑动窗口
-//   - LongTerm   长期记忆：TF 词袋向量 + 重要性加权的语义召回
+//   - LongTerm   长期记忆：支持语义向量（embedding）或 TF 词袋降级
 //   - Preference 用户偏好：从对话中自动提取并持久化的键值对
 package memory
 
@@ -48,12 +48,13 @@ func (m *ShortTerm) Add(role, content string) {
 
 // Item 是长期记忆的存储单元
 type Item struct {
-	ID         int     `json:"id"`
-	Content    string  `json:"content"`
-	Importance float64 `json:"importance"` // 0~1，越高越重要
+	ID         int       `json:"id"`
+	Content    string    `json:"content"`
+	Importance float64   `json:"importance"` // 0~1，越高越重要
+	Embedding  []float64 `json:"embedding,omitempty"`
 }
 
-// LongTerm 基于 TF 词袋向量实现语义召回，重要性参与打分加权
+// LongTerm 支持语义向量召回（embedding 优先）或 TF 词袋降级
 type LongTerm struct {
 	Items   []Item
 	vocabID map[string]int
@@ -85,33 +86,58 @@ func (m *LongTerm) textToVector(text string) []float64 {
 	return vec
 }
 
-// Store 将内容存入长期记忆，importance 决定后续召回权重
-func (m *LongTerm) Store(content string, importance float64) {
+// Store 将内容存入长期记忆（embedding 可选，传 nil 则使用 TF 降级）
+func (m *LongTerm) Store(content string, importance float64, embedding []float64) {
 	for _, item := range m.Items {
 		m.buildVocab(item.Content)
 	}
 	m.buildVocab(content)
-	m.Items = append(m.Items, Item{ID: m.nextID, Content: content, Importance: importance})
+	m.Items = append(m.Items, Item{
+		ID:         m.nextID,
+		Content:    content,
+		Importance: importance,
+		Embedding:  embedding,
+	})
 	m.nextID++
 }
 
-// Recall 从长期记忆中召回与 query 最相关的 topK 条（语义 0.7 + 重要性 0.3）
-func (m *LongTerm) Recall(query string, topK int) []Item {
+// StoreItem 直接插入已有 Item（用于从 DB 恢复数据）
+func (m *LongTerm) StoreItem(item Item) {
+	m.buildVocab(item.Content)
+	if item.ID >= m.nextID {
+		m.nextID = item.ID + 1
+	}
+	m.Items = append(m.Items, item)
+}
+
+// Recall 从长期记忆中召回与 query 最相关的 topK 条
+// 优先使用 embedding 余弦相似度，若无 embedding 则退回 TF
+func (m *LongTerm) Recall(query string, topK int, queryEmbedding []float64) []Item {
 	if len(m.Items) == 0 {
 		return nil
 	}
-	qv := m.textToVector(query)
 	type scored struct {
 		item Item
 		s    float64
 	}
 	var items []scored
 	for _, item := range m.Items {
-		iv := m.textToVector(item.Content)
-		items = append(items, scored{
-			item: item,
-			s:    cosine(qv, iv)*0.7 + item.Importance*0.3,
-		})
+		var sim float64
+		if len(queryEmbedding) > 0 && len(item.Embedding) == len(queryEmbedding) {
+			sim = cosine(queryEmbedding, item.Embedding)
+		} else {
+			// TF 降级
+			m.buildVocab(query)
+			qv := m.textToVector(query)
+			iv := m.textToVector(item.Content)
+			if len(qv) < len(iv) {
+				qv = append(qv, make([]float64, len(iv)-len(qv))...)
+			} else if len(iv) < len(qv) {
+				iv = append(iv, make([]float64, len(qv)-len(iv))...)
+			}
+			sim = cosine(qv, iv)
+		}
+		items = append(items, scored{item: item, s: sim*0.7 + item.Importance*0.3})
 	}
 	for i := 0; i < len(items); i++ {
 		for j := i + 1; j < len(items); j++ {
@@ -142,13 +168,49 @@ func NewPreference() *Preference {
 	return &Preference{Data: make(map[string]string)}
 }
 
-// ExtractAndSave 从对话文本中提取偏好并保存，返回 (key, value, 是否提取成功)
-func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
-	key, value, ok = extractInfo(msg)
-	if ok {
+// Save 保存单条偏好
+func (p *Preference) Save(key, value string) {
+	if key != "" && value != "" {
 		p.Data[key] = value
 	}
-	return
+}
+
+// SaveBatch 批量保存偏好（从 LLM 提取结果）
+func (p *Preference) SaveBatch(kvs map[string]string) {
+	for k, v := range kvs {
+		if k != "" && v != "" {
+			p.Data[k] = v
+		}
+	}
+}
+
+// ExtractAndSave 从对话文本中用规则提取偏好（兜底，LLM 提取优先）
+func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
+	if strings.Contains(msg, "我喜欢") {
+		parts := strings.SplitN(msg, "喜欢", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			key, value = "喜好", strings.TrimSpace(parts[1])
+			p.Data[key] = value
+			return key, value, true
+		}
+	}
+	if strings.Contains(msg, "我爱") {
+		parts := strings.SplitN(msg, "爱", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			key, value = "喜好", strings.TrimSpace(parts[1])
+			p.Data[key] = value
+			return key, value, true
+		}
+	}
+	if strings.Contains(msg, "我叫") {
+		parts := strings.SplitN(msg, "叫", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			key, value = "姓名", strings.TrimSpace(parts[1])
+			p.Data[key] = value
+			return key, value, true
+		}
+	}
+	return "", "", false
 }
 
 // BuildContext 将偏好数据格式化为给 LLM 的上下文字符串
@@ -164,29 +226,6 @@ func (p *Preference) BuildContext() string {
 }
 
 // ─────────────────────────────── 内部工具函数 ────────────────────────────
-
-// extractInfo 从消息中提取偏好键值（规则驱动）
-func extractInfo(msg string) (key, value string, ok bool) {
-	if strings.Contains(msg, "我喜欢") {
-		parts := strings.SplitN(msg, "喜欢", 2)
-		if len(parts) == 2 {
-			return "喜好", strings.TrimSpace(parts[1]), true
-		}
-	}
-	if strings.Contains(msg, "我爱") {
-		parts := strings.SplitN(msg, "爱", 2)
-		if len(parts) == 2 {
-			return "喜好", strings.TrimSpace(parts[1]), true
-		}
-	}
-	if strings.Contains(msg, "我叫") {
-		parts := strings.SplitN(msg, "叫", 2)
-		if len(parts) == 2 {
-			return "姓名", strings.TrimSpace(parts[1]), true
-		}
-	}
-	return "", "", false
-}
 
 // tokenize 将文本切成词元（中文逐字，英文按单词）
 func tokenize(text string) []string {

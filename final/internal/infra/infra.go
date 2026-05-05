@@ -21,10 +21,10 @@ import (
 
 // Status 记录各基础设施的连接状态
 type Status struct {
-	Milvus     string `json:"milvus"`
-	PostgreSQL string `json:"postgresql"`
-	ES         string `json:"elasticsearch"`
-	Kafka      string `json:"kafka"`
+	Milvus string `json:"milvus"`
+	PG     string `json:"pg"`
+	ES     string `json:"elasticsearch"`
+	Kafka  string `json:"kafka"`
 }
 
 // Infrastructure 持有所有外部连接句柄
@@ -67,16 +67,16 @@ func (inf *Infrastructure) connectPostgres() {
 	pg, err := sql.Open("postgres", inf.cfg.PGDSN())
 	if err != nil {
 		log.Printf("⚠️  PostgreSQL 打开失败: %v", err)
-		inf.Ready.PostgreSQL = "disconnected"
+		inf.Ready.PG = "disconnected"
 		return
 	}
 	if err := pg.Ping(); err != nil {
 		log.Printf("⚠️  PostgreSQL Ping 失败: %v", err)
-		inf.Ready.PostgreSQL = "disconnected"
+		inf.Ready.PG = "disconnected"
 		return
 	}
 	inf.pg = pg
-	inf.Ready.PostgreSQL = "connected"
+	inf.Ready.PG = "connected"
 	inf.initPGSchema()
 	log.Println("✅ PostgreSQL 已连接:", inf.cfg.PGDSN())
 }
@@ -151,6 +151,13 @@ func (inf *Infrastructure) initPGSchema() {
 			content    TEXT NOT NULL,
 			created_at TIMESTAMP DEFAULT NOW()
 		)`,
+		`CREATE TABLE IF NOT EXISTS long_term_memory (
+			id          SERIAL PRIMARY KEY,
+			content     TEXT NOT NULL,
+			importance  FLOAT NOT NULL DEFAULT 0.5,
+			embedding   JSONB,
+			created_at  TIMESTAMP DEFAULT NOW()
+		)`,
 	}
 	for _, ddl := range ddls {
 		if _, err := inf.pg.Exec(ddl); err != nil {
@@ -188,6 +195,78 @@ func (inf *Infrastructure) SaveSnapshot(taskID string, stateJSON []byte) {
 	if err != nil {
 		log.Printf("⚠️  快照保存到 PG 失败: %v", err)
 	}
+}
+
+// LoadPreferences 从 PostgreSQL 加载指定用户的全部偏好，返回 map[key]value
+func (inf *Infrastructure) LoadPreferences(userID string) map[string]string {
+	result := make(map[string]string)
+	if inf.pg == nil {
+		return result
+	}
+	rows, err := inf.pg.Query(`SELECT key, value FROM user_preferences WHERE user_id = $1`, userID)
+	if err != nil {
+		log.Printf("⚠️  加载偏好失败: %v", err)
+		return result
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err == nil {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// LongTermRow 是从 PG 读取的长期记忆行
+type LongTermRow struct {
+	ID         int
+	Content    string
+	Importance float64
+	Embedding  []float64
+}
+
+// SaveLongTermItem 将一条长期记忆持久化到 PostgreSQL，返回数据库自增 ID
+func (inf *Infrastructure) SaveLongTermItem(content string, importance float64, embeddingJSON []byte) int {
+	if inf.pg == nil {
+		return -1
+	}
+	var id int
+	err := inf.pg.QueryRow(
+		`INSERT INTO long_term_memory (content, importance, embedding) VALUES ($1, $2, $3) RETURNING id`,
+		content, importance, embeddingJSON,
+	).Scan(&id)
+	if err != nil {
+		log.Printf("⚠️  长期记忆保存失败: %v", err)
+		return -1
+	}
+	return id
+}
+
+// LoadLongTermItems 从 PostgreSQL 加载全部长期记忆条目
+func (inf *Infrastructure) LoadLongTermItems() []LongTermRow {
+	if inf.pg == nil {
+		return nil
+	}
+	rows, err := inf.pg.Query(`SELECT id, content, importance, embedding FROM long_term_memory ORDER BY id`)
+	if err != nil {
+		log.Printf("⚠️  加载长期记忆失败: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	var items []LongTermRow
+	for rows.Next() {
+		var row LongTermRow
+		var embJSON []byte
+		if err := rows.Scan(&row.ID, &row.Content, &row.Importance, &embJSON); err != nil {
+			continue
+		}
+		if len(embJSON) > 0 {
+			json.Unmarshal(embJSON, &row.Embedding)
+		}
+		items = append(items, row)
+	}
+	return items
 }
 
 // ─────────────────────────────── Elasticsearch ───────────────────────────

@@ -6,6 +6,7 @@ import (
 	"final/config"
 	"final/internal/agent"
 	"final/internal/infra"
+	"final/internal/tools"
 	"net/http"
 	"unicode/utf8"
 )
@@ -29,6 +30,7 @@ func (s *Server) registerRoutes() {
 	http.HandleFunc("/api/upload",    s.upload)
 	http.HandleFunc("/api/memory",    s.memory)
 	http.HandleFunc("/api/tools",     s.toolsList)
+	http.HandleFunc("/api/tools/mcp", s.registerMCPTool)
 	http.HandleFunc("/api/snapshots", s.snapshots)
 	http.HandleFunc("/api/status",    s.status)
 }
@@ -42,13 +44,21 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Message string `json:"message"`
+		Message       string   `json:"message"`
+		UseRAG        bool     `json:"use_rag"`
+		SelectedTools []string `json:"selected_tools"` // nil=自动路由, []=禁用工具, ["x"]=指定工具
+		Explicit      bool     `json:"explicit"`       // true 时前端显式控制路由
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	resp := s.agent.Process(req.Message)
+	opts := agent.ChatOptions{
+		UseRAG:        req.UseRAG,
+		SelectedTools: req.SelectedTools,
+		Explicit:      req.Explicit,
+	}
+	resp := s.agent.ProcessWithOptions(req.Message, opts)
 	writeJSON(w, resp)
 }
 
@@ -84,14 +94,41 @@ func (s *Server) memory(w http.ResponseWriter, r *http.Request) {
 // GET /api/tools — 列出所有可用工具
 func (s *Server) toolsList(w http.ResponseWriter, r *http.Request) {
 	type toolInfo struct {
-		Name string      `json:"name"`
-		Desc string      `json:"description"`
+		Name  string       `json:"name"`
+		Desc  string       `json:"description"`
+		IsMCP bool         `json:"is_mcp,omitempty"`
+		Params []tools.Param `json:"params,omitempty"`
 	}
 	var list []toolInfo
 	for _, t := range s.agent.Tools() {
-		list = append(list, toolInfo{Name: t.Name, Desc: t.Description})
+		list = append(list, toolInfo{Name: t.Name, Desc: t.Description, IsMCP: t.IsMCP, Params: t.Parameters})
 	}
 	writeJSON(w, list)
+}
+
+// POST /api/tools/mcp — 动态注册一个 MCP 工具
+func (s *Server) registerMCPTool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name        string        `json:"name"`
+		Description string        `json:"description"`
+		Endpoint    string        `json:"endpoint"`
+		Params      []tools.Param `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" || req.Endpoint == "" {
+		http.Error(w, "name and endpoint are required", http.StatusBadRequest)
+		return
+	}
+	t := tools.NewMCPTool(req.Name, req.Description, req.Endpoint, req.Params)
+	s.agent.RegisterTool(t)
+	writeJSON(w, map[string]interface{}{"ok": true, "name": req.Name})
 }
 
 // GET /api/snapshots — 列出任务执行快照摘要

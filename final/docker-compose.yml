@@ -6,23 +6,9 @@ services:
     ports:
       - "8090:8090"
     environment:
-      - LLM_API_URL=${LLM_API_URL:-}
-      - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_MODEL=${LLM_MODEL:-ernie-bot-4}
-      - EMBEDDING_API_URL=${EMBEDDING_API_URL:-}
-      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-embedding-v1}
-      - MILVUS_HOST=milvus
-      - PG_HOST=postgres
-      - PG_USER=aiagent
-      - PG_PASSWORD=aiagent123
-      - PG_DATABASE=aiagent
-      - ES_ADDRESS=http://elasticsearch:9200
-      - ES_USERNAME=elastic
-      - ES_PASSWORD=changeme
-      - KAFKA_BROKER=kafka:9092
-      - KAFKA_TOPIC=agent-events
       - TZ=Asia/Shanghai
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
     depends_on:
       milvus:
         condition: service_healthy
@@ -37,7 +23,7 @@ services:
   # ===== Milvus 向量数据库 =====
   etcd:
     container_name: milvus-etcd
-    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/quay.io/coreos/etcd:v3.5.18
+    image: quay.io/coreos/etcd:v3.5.18
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
       - ETCD_AUTO_COMPACTION_RETENTION=1000
@@ -54,7 +40,7 @@ services:
 
   minio:
     container_name: milvus-minio
-    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/minio/minio:RELEASE.2023-03-20T20-16-18Z
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -72,7 +58,7 @@ services:
 
   milvus:
     container_name: milvus-standalone
-    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/milvusdb/milvus:v2.4.17
+    image: milvusdb/milvus:v2.4.17
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
@@ -99,7 +85,7 @@ services:
   # ===== PostgreSQL 关系型数据库 =====
   postgres:
     container_name: postgres
-    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/postgres:16-alpine
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: aiagent
       POSTGRES_PASSWORD: aiagent123
@@ -117,7 +103,7 @@ services:
   # ===== Elasticsearch =====
   elasticsearch:
     container_name: elasticsearch
-    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/elasticsearch:8.17.0
+    image: elasticsearch:8.17.0
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
@@ -136,7 +122,7 @@ services:
   # ===== Kafka =====
   zookeeper:
     container_name: zookeeper
-    image: docker.1ms.run/confluentinc/cp-zookeeper:7.8.0
+    image: confluentinc/cp-zookeeper:7.8.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -145,13 +131,17 @@ services:
 
   kafka:
     container_name: kafka
-    image: docker.1ms.run/confluentinc/cp-kafka:7.8.0
+    image: confluentinc/cp-kafka:7.8.0
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     volumes:

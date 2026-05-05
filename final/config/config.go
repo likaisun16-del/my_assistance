@@ -2,7 +2,10 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
+
+	"gopkg.in/yaml.v3"
 )
 
 // APIConfig 整合所有阶段的 API + 基础设施配置
@@ -53,51 +56,125 @@ type APIConfig struct {
 	StepTimeoutMs int
 	MaxIterations int
 
+	// ===== 搜索 API（可选，支持 Tavily 等）=====
+	SearchAPIKey string
+	SearchAPIURL string
+
 	// ===== 通用配置 =====
 	ServerPort string
 }
 
-// DefaultConfig 返回默认配置，优先读取环境变量（Docker Compose 注入）
+// yamlFile 对应 config/config.yaml 的结构
+type yamlFile struct {
+	LLM struct {
+		APIUrl      string  `yaml:"api_url"`
+		APIKey      string  `yaml:"api_key"`
+		Model       string  `yaml:"model"`
+		Temperature float64 `yaml:"temperature"`
+	} `yaml:"llm"`
+	Embedding struct {
+		APIUrl string `yaml:"api_url"`
+		APIKey string `yaml:"api_key"`
+		Model  string `yaml:"model"`
+	} `yaml:"embedding"`
+	Milvus struct {
+		Host string `yaml:"host"`
+		Port int    `yaml:"port"`
+	} `yaml:"milvus"`
+	Postgres struct {
+		Host     string `yaml:"host"`
+		Port     int    `yaml:"port"`
+		User     string `yaml:"user"`
+		Password string `yaml:"password"`
+		Database string `yaml:"database"`
+	} `yaml:"postgres"`
+	Elasticsearch struct {
+		Addresses []string `yaml:"addresses"`
+		Username  string   `yaml:"username"`
+		Password  string   `yaml:"password"`
+	} `yaml:"elasticsearch"`
+	Kafka struct {
+		Brokers []string `yaml:"brokers"`
+		Topic   string   `yaml:"topic"`
+	} `yaml:"kafka"`
+	RAG struct {
+		ChunkSize    int `yaml:"chunk_size"`
+		ChunkOverlap int `yaml:"chunk_overlap"`
+		TopK         int `yaml:"top_k"`
+	} `yaml:"rag"`
+	Memory struct {
+		ShortTermMaxTurns int `yaml:"short_term_max_turns"`
+		LongTermTopK      int `yaml:"long_term_top_k"`
+	} `yaml:"memory"`
+	Harness struct {
+		MaxRetries    int `yaml:"max_retries"`
+		RetryDelayMs  int `yaml:"retry_delay_ms"`
+		StepTimeoutMs int `yaml:"step_timeout_ms"`
+		MaxIterations int `yaml:"max_iterations"`
+	} `yaml:"harness"`
+	Server struct {
+		Port string `yaml:"port"`
+	} `yaml:"server"`
+	Search struct {
+		APIKey string `yaml:"api_key"`
+		APIURL string `yaml:"api_url"`
+	} `yaml:"search"`
+}
+
+// DefaultConfig 从 config/config.yaml 加载配置
 func DefaultConfig() *APIConfig {
+	data, err := os.ReadFile("config/config.yaml")
+	if err != nil {
+		log.Fatalf("读取 config/config.yaml 失败: %v", err)
+	}
+
+	var y yamlFile
+	if err := yaml.Unmarshal(data, &y); err != nil {
+		log.Fatalf("解析 config/config.yaml 失败: %v", err)
+	}
+
 	return &APIConfig{
-		LLMAPIUrl:        envOr("LLM_API_URL", "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions"),
-		LLMAPIKey:        envOr("LLM_API_KEY", ""),
-		LLMModel:         envOr("LLM_MODEL", "ernie-bot-4"),
-		Temperature:      0.7,
+		LLMAPIUrl:   y.LLM.APIUrl,
+		LLMAPIKey:   y.LLM.APIKey,
+		LLMModel:    y.LLM.Model,
+		Temperature: y.LLM.Temperature,
 
-		EmbeddingAPIUrl:  envOr("EMBEDDING_API_URL", "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/embeddings/embedding-v1"),
-		EmbeddingAPIKey:  envOr("EMBEDDING_API_KEY", ""),
-		EmbeddingModel:   envOr("EMBEDDING_MODEL", "embedding-v1"),
+		EmbeddingAPIUrl: y.Embedding.APIUrl,
+		EmbeddingAPIKey: y.Embedding.APIKey,
+		EmbeddingModel:  y.Embedding.Model,
 
-		MilvusHost:       envOr("MILVUS_HOST", "milvus"),
-		MilvusPort:       19530,
+		MilvusHost: y.Milvus.Host,
+		MilvusPort: y.Milvus.Port,
 
-		PGHost:           envOr("PG_HOST", "postgres"),
-		PGPort:           5432,
-		PGUser:           envOr("PG_USER", "aiagent"),
-		PGPassword:       envOr("PG_PASSWORD", "aiagent123"),
-		PGDatabase:       envOr("PG_DATABASE", "aiagent"),
+		PGHost:     y.Postgres.Host,
+		PGPort:     y.Postgres.Port,
+		PGUser:     y.Postgres.User,
+		PGPassword: y.Postgres.Password,
+		PGDatabase: y.Postgres.Database,
 
-		ESAddresses:      []string{envOr("ES_ADDRESS", "http://elasticsearch:9200")},
-		ESUsername:       envOr("ES_USERNAME", "elastic"),
-		ESPassword:       envOr("ES_PASSWORD", "changeme"),
+		ESAddresses: y.Elasticsearch.Addresses,
+		ESUsername:  y.Elasticsearch.Username,
+		ESPassword:  y.Elasticsearch.Password,
 
-		KafkaBrokers:     []string{envOr("KAFKA_BROKER", "kafka:9092")},
-		KafkaTopic:       envOr("KAFKA_TOPIC", "agent-events"),
+		KafkaBrokers: y.Kafka.Brokers,
+		KafkaTopic:   y.Kafka.Topic,
 
-		ChunkSize:        200,
-		ChunkOverlap:     50,
-		TopK:             3,
+		ChunkSize:    y.RAG.ChunkSize,
+		ChunkOverlap: y.RAG.ChunkOverlap,
+		TopK:         y.RAG.TopK,
 
-		ShortTermMaxTurns: 5,
-		LongTermTopK:      3,
+		ShortTermMaxTurns: y.Memory.ShortTermMaxTurns,
+		LongTermTopK:      y.Memory.LongTermTopK,
 
-		MaxRetries:      3,
-		RetryDelayMs:    200,
-		StepTimeoutMs:   5000,
-		MaxIterations:   5,
+		MaxRetries:    y.Harness.MaxRetries,
+		RetryDelayMs:  y.Harness.RetryDelayMs,
+		StepTimeoutMs: y.Harness.StepTimeoutMs,
+		MaxIterations: y.Harness.MaxIterations,
 
-		ServerPort:      envOr("SERVER_PORT", "8090"),
+		SearchAPIKey: y.Search.APIKey,
+		SearchAPIURL: y.Search.APIURL,
+
+		ServerPort: y.Server.Port,
 	}
 }
 
@@ -106,21 +183,11 @@ func (c *APIConfig) IsRealEmbedding() bool { return c.EmbeddingAPIKey != "" }
 
 // PGDSN 返回 PostgreSQL 连接串
 func (c *APIConfig) PGDSN() string {
-	return fmtDSN("postgres", c.PGUser, c.PGPassword, c.PGHost, c.PGPort, c.PGDatabase)
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		c.PGUser, c.PGPassword, c.PGHost, c.PGPort, c.PGDatabase)
 }
 
 // MilvusAddr 返回 Milvus 地址
 func (c *APIConfig) MilvusAddr() string {
 	return fmt.Sprintf("%s:%d", c.MilvusHost, c.MilvusPort)
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func fmtDSN(driver, user, pass, host string, port int, db string) string {
-	return fmt.Sprintf("%s://%s:%s@%s:%d/%s?sslmode=disable", driver, user, pass, host, port, db)
 }

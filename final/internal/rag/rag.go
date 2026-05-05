@@ -171,11 +171,12 @@ func (v *VectorStore) Search(query string, topK int) []SearchResult {
 
 // Engine 整合文本分割、向量检索与答案生成
 type Engine struct {
-	cfg      *config.APIConfig
-	store    *VectorStore
-	splitter *TextSplitter
-	Loaded   bool
-	inf      *infra.Infrastructure
+	cfg        *config.APIConfig
+	store      *VectorStore
+	splitter   *TextSplitter
+	Loaded     bool
+	inf        *infra.Infrastructure
+	generateFn func(systemPrompt string, userMsg string) string // LLM 回调，由 agent 注入
 }
 
 // NewEngine 创建 RAG 引擎
@@ -186,6 +187,11 @@ func NewEngine(cfg *config.APIConfig, inf *infra.Infrastructure) *Engine {
 		splitter: NewTextSplitter(cfg.ChunkSize, cfg.ChunkOverlap),
 		inf:      inf,
 	}
+}
+
+// SetGenerateFn 注入 LLM 调用回调，供 Query 合成答案
+func (e *Engine) SetGenerateFn(fn func(systemPrompt string, userMsg string) string) {
+	e.generateFn = fn
 }
 
 // Ingest 将文档切分并建立向量索引，返回切片数量
@@ -210,8 +216,17 @@ func (e *Engine) Query(question string) (string, []SearchResult) {
 		}
 	}
 	context := strings.Join(parts, "\n\n")
-	answer := fmt.Sprintf("基于知识库回答：\n\n问题「%s」的相关文档已检索到，上下文分析如下：\n%s", question, context)
-	return answer, results
+	if context == "" {
+		return "知识库中未找到相关内容。", results
+	}
+	if e.generateFn != nil {
+		systemPrompt := "你是一个基于知识库回答问题的助手。请仅根据提供的上下文内容回答问题，不要编造信息。如果上下文不足以回答，请说明。"
+		userMsg := fmt.Sprintf("上下文：\n%s\n\n问题：%s", context, question)
+		answer := e.generateFn(systemPrompt, userMsg)
+		return answer, results
+	}
+	// 无 LLM 时直接返回检索到的原文
+	return fmt.Sprintf("【知识库检索结果】\n%s", context), results
 }
 
 // Chunks 返回当前已索引的所有切片（供状态接口使用）
