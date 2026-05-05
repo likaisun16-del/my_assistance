@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Final Stage - 全阶段整合 AI 助手</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f0f1a; color: #e0e0e0; height: 100vh; display: flex; }
+
+        /* ===== Sidebar ===== */
+        .sidebar { width: 320px; background: #161625; border-right: 1px solid #2a2a3e; display: flex; flex-direction: column; overflow: hidden; }
+        .sidebar-header { padding: 20px; border-bottom: 1px solid #2a2a3e; }
+        .sidebar-header h2 { font-size: 18px; color: #FF6B6B; margin-bottom: 4px; }
+        .sidebar-header .sub { font-size: 12px; color: #666; }
+        .stage-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 12px; }
+        .stage-badge { padding: 3px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+        .stage-badge.s1 { background: #4A90D9; color: #fff; }
+        .stage-badge.s2 { background: #27AE60; color: #fff; }
+        .stage-badge.s3 { background: #E67E22; color: #fff; }
+        .stage-badge.s4 { background: #8E44AD; color: #fff; }
+        .stage-badge.s5 { background: #E74C8B; color: #fff; }
+        .stage-badge.s6 { background: #C0392B; color: #fff; }
+
+        .sidebar-body { flex: 1; overflow-y: auto; padding: 16px; }
+        .panel { margin-bottom: 16px; }
+        .panel h3 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+        .panel h3 .arrow { transition: transform 0.2s; font-size: 10px; }
+        .panel.collapsed h3 .arrow { transform: rotate(-90deg); }
+        .panel.collapsed .panel-body { display: none; }
+        .panel-body { }
+        .info-row { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0; border-bottom: 1px solid #1a1a2e; }
+        .info-row .label { color: #888; }
+        .info-row .val { color: #ccc; }
+
+        .rag-upload { margin-top: 8px; }
+        .rag-upload textarea { width: 100%; height: 60px; background: #1e1e32; border: 1px solid #2a2a3e; border-radius: 6px; padding: 8px; color: #e0e0e0; font-size: 12px; resize: none; outline: none; }
+        .rag-upload textarea:focus { border-color: #27AE60; }
+        .rag-upload button { margin-top: 4px; background: #27AE60; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
+        .rag-upload .status { font-size: 11px; color: #27AE60; margin-top: 4px; }
+
+        .mem-item { background: #1e1e32; border-radius: 6px; padding: 6px 10px; margin-bottom: 4px; font-size: 12px; color: #aaa; }
+        .mem-item .key { color: #E74C8B; font-weight: 600; }
+        .mem-item .val { color: #27AE60; }
+        .tool-item { background: #1e1e32; border-radius: 6px; padding: 6px 10px; margin-bottom: 4px; font-size: 12px; }
+        .tool-item .name { color: #E67E22; font-weight: 600; }
+
+        /* ===== Main ===== */
+        .main { flex: 1; display: flex; flex-direction: column; }
+        .header { padding: 16px 24px; border-bottom: 1px solid #2a2a3e; display: flex; align-items: center; gap: 12px; }
+        .header h1 { font-size: 16px; color: #FF6B6B; font-weight: 600; }
+        .mode-indicator { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .mode-indicator.chat { background: #4A90D9; color: #fff; }
+        .mode-indicator.rag { background: #27AE60; color: #fff; }
+        .mode-indicator.tool { background: #E67E22; color: #fff; }
+        .mode-indicator.react { background: #8E44AD; color: #fff; }
+        .mode-indicator.memory { background: #E74C8B; color: #fff; }
+
+        .messages { flex: 1; overflow-y: auto; padding: 24px; }
+        .msg { margin-bottom: 16px; display: flex; }
+        .msg.user { justify-content: flex-end; }
+        .msg .bubble { max-width: 75%; padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+        .msg.user .bubble { background: #FF6B6B; color: #fff; border-bottom-right-radius: 4px; }
+        .msg.assistant .bubble { background: #1e1e32; border: 1px solid #2a2a3e; border-bottom-left-radius: 4px; }
+        .msg .tag { font-size: 11px; color: #666; margin-bottom: 4px; }
+
+        .mode-tag { display: inline-block; padding: 2px 8px; border-radius: 8px; font-size: 10px; font-weight: 600; margin-bottom: 6px; }
+        .mode-tag.chat { background: rgba(74,144,217,0.2); color: #4A90D9; }
+        .mode-tag.rag { background: rgba(39,174,96,0.2); color: #27AE60; }
+        .mode-tag.tool { background: rgba(230,126,34,0.2); color: #E67E22; }
+        .mode-tag.react { background: rgba(142,68,173,0.2); color: #8E44AD; }
+        .mode-tag.memory { background: rgba(231,76,139,0.2); color: #E74C8B; }
+
+        .react-step { background: #1a1030; border-radius: 6px; padding: 8px 12px; margin: 4px 0; font-size: 12px; border-left: 3px solid #666; }
+        .react-step.thought { border-left-color: #8E44AD; }
+        .react-step.action { border-left-color: #E67E22; }
+        .react-step.observation { border-left-color: #27AE60; }
+        .react-step.final { border-left-color: #3498DB; background: #0f1a2e; }
+        .react-step .step-type { font-weight: 600; font-size: 11px; }
+        .react-step.thought .step-type { color: #8E44AD; }
+        .react-step.action .step-type { color: #E67E22; }
+        .react-step.observation .step-type { color: #27AE60; }
+        .react-step.final .step-type { color: #3498DB; }
+
+        .tool-call-box { background: #2a1e10; border: 1px solid #E67E22; border-radius: 6px; padding: 8px 12px; margin: 6px 0; font-size: 12px; }
+        .tool-call-box .tc-label { color: #E67E22; font-weight: 600; }
+        .tool-call-box .tc-detail { color: #aaa; margin-top: 2px; }
+
+        .rag-result { background: #1a2a1a; border: 1px solid #27AE60; border-radius: 6px; padding: 8px 12px; margin: 6px 0; font-size: 12px; color: #aaa; }
+        .rag-result .sim { color: #27AE60; font-weight: 600; }
+
+        .extracted-box { background: #2a1a2e; border: 1px solid #E74C8B; border-radius: 6px; padding: 6px 10px; margin: 6px 0; font-size: 12px; color: #E74C8B; }
+
+        .task-step { background: #1a1020; border-radius: 6px; padding: 6px 12px; margin: 4px 0; font-size: 12px; border-left: 3px solid #666; }
+        .task-step.done { border-left-color: #27AE60; }
+        .task-step.failed { border-left-color: #C0392B; }
+        .task-step .step-name { font-weight: 600; }
+        .task-step.done .step-name { color: #27AE60; }
+        .task-step.failed .step-name { color: #C0392B; }
+        .retry-badge { background: #f0ad4e; color: #000; padding: 1px 6px; border-radius: 4px; font-size: 10px; margin-left: 4px; }
+
+        .input-area { padding: 16px 24px; border-top: 1px solid #2a2a3e; display: flex; gap: 12px; }
+        .input-area input { flex: 1; background: #1e1e32; border: 1px solid #2a2a3e; border-radius: 8px; padding: 12px 16px; color: #e0e0e0; font-size: 14px; outline: none; }
+        .input-area input:focus { border-color: #FF6B6B; }
+        .input-area button { background: #FF6B6B; color: #fff; border: none; border-radius: 8px; padding: 12px 24px; cursor: pointer; font-size: 14px; font-weight: 600; }
+        .input-area button:hover { background: #e55a5a; }
+
+        .quick-actions { padding: 8px 24px 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+        .quick-btn { background: #1e1e32; border: 1px solid #2a2a3e; border-radius: 16px; padding: 4px 12px; font-size: 12px; color: #888; cursor: pointer; transition: all 0.2s; }
+        .quick-btn:hover { border-color: #FF6B6B; color: #FF6B6B; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <h2>Final Stage</h2>
+            <div class="sub">全阶段整合 AI 助手</div>
+            <div class="stage-badges">
+                <span class="stage-badge s1">1.Chat</span>
+                <span class="stage-badge s2">2.RAG</span>
+                <span class="stage-badge s3">3.Tool</span>
+                <span class="stage-badge s4">4.ReAct</span>
+                <span class="stage-badge s5">5.Memory</span>
+                <span class="stage-badge s6">6.Harness</span>
+            </div>
+        </div>
+        <div class="sidebar-body">
+            <!-- 系统状态 -->
+            <div class="panel" id="panelStatus">
+                <h3 onclick="togglePanel(this)"><span class="arrow">▼</span> 系统状态</h3>
+                <div class="panel-body" id="statusBody">
+                    <div class="info-row"><span class="label">LLM</span><span class="val" id="sLLM">-</span></div>
+                    <div class="info-row"><span class="label">Embedding</span><span class="val" id="sEmb">-</span></div>
+                    <div class="info-row"><span class="label">模式</span><span class="val" id="sMode">-</span></div>
+                </div>
+            </div>
+            <!-- RAG -->
+            <div class="panel" id="panelRAG">
+                <h3 onclick="togglePanel(this)"><span class="arrow">▼</span> Stage 2: RAG 知识库</h3>
+                <div class="panel-body">
+                    <div class="info-row"><span class="label">状态</span><span class="val" id="ragStatus">未加载</span></div>
+                    <div class="info-row"><span class="label">切片数</span><span class="val" id="ragChunks">0</span></div>
+                    <div class="rag-upload">
+                        <textarea id="docInput" placeholder="粘贴文档内容...">Go语言是Google在2009年推出的开源编程语言。核心特性：并发编程(goroutine/channel)、编译速度快、垃圾回收、标准库丰富、跨平台部署。Docker就是用Go语言开发的。</textarea>
+                        <button onclick="uploadDoc()">上传文档</button>
+                        <div class="status" id="uploadStatus"></div>
+                    </div>
+                </div>
+            </div>
+            <!-- 工具 -->
+            <div class="panel" id="panelTools">
+                <h3 onclick="togglePanel(this)"><span class="arrow">▼</span> Stage 3: 工具</h3>
+                <div class="panel-body" id="toolsBody"></div>
+            </div>
+            <!-- 记忆 -->
+            <div class="panel" id="panelMemory">
+                <h3 onclick="togglePanel(this)"><span class="arrow">▼</span> Stage 5: 记忆</h3>
+                <div class="panel-body">
+                    <div class="info-row"><span class="label">短期记忆</span><span class="val" id="stmCount">0条</span></div>
+                    <div class="info-row"><span class="label">长期记忆</span><span class="val" id="ltmCount">0条</span></div>
+                    <div id="prefList"></div>
+                </div>
+            </div>
+            <!-- 快照 -->
+            <div class="panel" id="panelSnapshots">
+                <h3 onclick="togglePanel(this)"><span class="arrow">▼</span> Stage 6: 快照</h3>
+                <div class="panel-body" id="snapBody"><div style="font-size:12px;color:#666;">执行ReAct任务后显示</div></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="header">
+            <h1>全阶段整合 AI 助手</h1>
+            <span class="mode-indicator chat" id="modeIndicator">Chat</span>
+        </div>
+        <div class="messages" id="messages">
+            <div class="msg assistant"><div>
+                <div class="tag">🤖 助手</div>
+                <div class="bubble">我是全阶段整合AI助手，集成了6大能力：\n\n• Stage 1: 基础聊天\n• Stage 2: RAG 知识库\n• Stage 3: 工具调用\n• Stage 4: ReAct 多步推理\n• Stage 5: 记忆管理\n• Stage 6: Harness 稳定执行\n\n我会根据你的问题自动选择最合适的处理模式。试试下方的快捷按钮吧！</div>
+            </div></div>
+        </div>
+        <div class="quick-actions">
+            <span class="quick-btn" onclick="quickSend('你是谁？')">💬 Chat</span>
+            <span class="quick-btn" onclick="quickSend('Go语言有什么特点？')">📚 RAG</span>
+            <span class="quick-btn" onclick="quickSend('现在几点？')">🔧 Tool</span>
+            <span class="quick-btn" onclick="quickSend('现在几点+东京天气+总结')">🧠 ReAct</span>
+            <span class="quick-btn" onclick="quickSend('我喜欢周杰伦')">💾 Memory</span>
+            <span class="quick-btn" onclick="quickSend('推荐音乐')">🎵 Memory+Chat</span>
+        </div>
+        <div class="input-area">
+            <input type="text" id="input" placeholder="输入任何问题，我会智能路由处理..." onkeydown="if(event.key==='Enter')send()">
+            <button onclick="send()">发送</button>
+        </div>
+    </div>
+
+    <script>
+        const modeLabels = { chat: 'Chat', rag: 'RAG', tool: 'Tool', react: 'ReAct', memory: 'Memory' };
+        const modeColors = { chat: '#4A90D9', rag: '#27AE60', tool: '#E67E22', react: '#8E44AD', memory: '#E74C8B' };
+        const stepIcons = { Thought: '💭', Action: '🔧', Observation: '👁️', 'Final Answer': '✅' };
+        const stepClass = { Thought: 'thought', Action: 'action', Observation: 'observation', 'Final Answer': 'final' };
+
+        function togglePanel(h3) { h3.parentElement.classList.toggle('collapsed'); }
+
+        // Load sidebar data
+        async function loadStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                document.getElementById('sLLM').textContent = data.llm_model;
+                document.getElementById('sEmb').textContent = data.embedding_model;
+                document.getElementById('sMode').textContent = data.is_mock ? '模拟' : '真实API';
+                document.getElementById('ragStatus').textContent = data.rag_loaded ? '✅ 已加载' : '未加载';
+                document.getElementById('ragChunks').textContent = data.rag_chunks ? data.rag_chunks.length : 0;
+                document.getElementById('stmCount').textContent = data.short_term_count + '条';
+                document.getElementById('ltmCount').textContent = data.long_term_count + '条';
+                const pl = document.getElementById('prefList');
+                if (data.preferences && Object.keys(data.preferences).length > 0) {
+                    pl.innerHTML = '';
+                    for (const [k,v] of Object.entries(data.preferences)) {
+                        pl.innerHTML += `<div class="mem-item"><span class="key">${k}</span>: <span class="val">${v}</span></div>`;
+                    }
+                }
+            } catch(e) {}
+        }
+
+        async function loadTools() {
+            try {
+                const res = await fetch('/api/tools');
+                const tools = await res.json();
+                const body = document.getElementById('toolsBody');
+                body.innerHTML = '';
+                tools.forEach(t => {
+                    body.innerHTML += `<div class="tool-item"><span class="name">🔧 ${t.name}</span> - ${t.desc}</div>`;
+                });
+            } catch(e) {}
+        }
+
+        async function uploadDoc() {
+            const content = document.getElementById('docInput').value.trim();
+            if (!content) return;
+            const res = await fetch('/api/upload', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({content}) });
+            const data = await res.json();
+            document.getElementById('uploadStatus').textContent = `✅ 已切分为 ${data.chunk_count} 个片段`;
+            loadStatus();
+        }
+
+        async function loadSnapshots() {
+            try {
+                const res = await fetch('/api/snapshots');
+                const snaps = await res.json();
+                const body = document.getElementById('snapBody');
+                if (!snaps || snaps.length === 0) { body.innerHTML = '<div style="font-size:12px;color:#666;">执行ReAct任务后显示</div>'; return; }
+                body.innerHTML = '';
+                snaps.forEach((s,i) => {
+                    body.innerHTML += `<div class="mem-item">📸 #${i} - ${s.timestamp} (${s.steps}步)</div>`;
+                });
+            } catch(e) {}
+        }
+
+        function updateModeIndicator(mode) {
+            const el = document.getElementById('modeIndicator');
+            el.textContent = modeLabels[mode] || mode;
+            el.className = 'mode-indicator ' + mode;
+        }
+
+        async function send() {
+            const input = document.getElementById('input');
+            const msg = input.value.trim();
+            if (!msg) return;
+            input.value = '';
+            addMessage('user', msg);
+
+            const res = await fetch('/api/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({message: msg}) });
+            const data = await res.json();
+
+            updateModeIndicator(data.mode);
+
+            let html = `<div class="mode-tag ${data.mode}">${modeLabels[data.mode] || data.mode} 模式</div>`;
+            html += data.answer.replace(/\n/g, '<br>');
+
+            // Tool call
+            if (data.tool_call) {
+                const tc = data.tool_call;
+                const params = Object.entries(tc.params||{}).map(([k,v])=>`${k}=${v}`).join(', ')||'无';
+                html += `<div class="tool-call-box"><div class="tc-label">🔧 调用: ${tc.tool_name}</div><div class="tc-detail">参数: ${params} | 结果: ${tc.tool_result}</div></div>`;
+            }
+
+            // RAG results
+            if (data.search_results && data.search_results.length > 0) {
+                html += '<br><br><strong>🔍 检索结果：</strong>';
+                data.search_results.forEach((r,i) => {
+                    html += `<div class="rag-result">#${i+1} <span class="sim">相似度: ${r.similarity.toFixed(4)}</span><br>${r.chunk.content.substring(0,80)}...</div>`;
+                });
+            }
+
+            // ReAct steps
+            if (data.steps && data.steps.length > 0) {
+                html += '<br>';
+                data.steps.forEach(s => {
+                    const cls = stepClass[s.type] || '';
+                    const icon = stepIcons[s.type] || '';
+                    html += `<div class="react-step ${cls}"><span class="step-type">${icon} ${s.type}</span><br>${s.content}</div>`;
+                });
+            }
+
+            // Task steps (Harness)
+            if (data.task && data.task.steps) {
+                html += '<br><div style="font-size:11px;color:#888;">任务状态: ' + data.task.status + '</div>';
+                data.task.steps.forEach(s => {
+                    const cls = s.status === 'done' ? 'done' : s.status === 'failed' ? 'failed' : '';
+                    const icon = s.status === 'done' ? '✅' : s.status === 'failed' ? '❌' : '🔄';
+                    const retry = s.retry_count > 0 ? `<span class="retry-badge">重试${s.retry_count}次</span>` : '';
+                    html += `<div class="task-step ${cls}">${icon} <span class="step-name">${s.name}</span>${retry}`;
+                    if (s.result) html += ` → ${s.result}`;
+                    if (s.error) html += ` → <span style="color:#C0392B">${s.error}</span>`;
+                    html += '</div>';
+                });
+            }
+
+            // Extracted info
+            if (data.extracted_info) {
+                html += `<div class="extracted-box">🧠 ${data.extracted_info}</div>`;
+            }
+
+            addMessage('assistant', html, true);
+
+            // Refresh sidebar
+            loadStatus();
+            loadSnapshots();
+        }
+
+        function quickSend(msg) {
+            document.getElementById('input').value = msg;
+            send();
+        }
+
+        function addMessage(role, content, isHtml) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + role;
+            const label = role === 'user' ? '👤 你' : '🤖 助手';
+            div.innerHTML = `<div><div class="tag">${label}</div><div class="bubble">${isHtml ? content : content.replace(/\n/g,'<br>')}</div></div>`;
+            document.getElementById('messages').appendChild(div);
+            document.getElementById('messages').scrollTop = 99999;
+        }
+
+        // Init
+        loadStatus();
+        loadTools();
+    </script>
+</body>
+</html>

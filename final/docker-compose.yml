@@ -1,0 +1,175 @@
+services:
+  # ===== AI Agent 应用 =====
+  final-agent:
+    build: .
+    container_name: final-ai-agent
+    ports:
+      - "8090:8090"
+    environment:
+      - LLM_API_URL=${LLM_API_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-ernie-bot-4}
+      - EMBEDDING_API_URL=${EMBEDDING_API_URL:-}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-embedding-v1}
+      - MILVUS_HOST=milvus
+      - PG_HOST=postgres
+      - PG_USER=aiagent
+      - PG_PASSWORD=aiagent123
+      - PG_DATABASE=aiagent
+      - ES_ADDRESS=http://elasticsearch:9200
+      - ES_USERNAME=elastic
+      - ES_PASSWORD=changeme
+      - KAFKA_BROKER=kafka:9092
+      - KAFKA_TOPIC=agent-events
+      - TZ=Asia/Shanghai
+    depends_on:
+      milvus:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===== Milvus 向量数据库 =====
+  etcd:
+    container_name: milvus-etcd
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    container_name: milvus-minio
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus:
+    container_name: milvus-standalone
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/milvusdb/milvus:v2.4.17
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      start_period: 60s
+      timeout: 10s
+      retries: 5
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # ===== PostgreSQL 关系型数据库 =====
+  postgres:
+    container_name: postgres
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/postgres:16-alpine
+    environment:
+      POSTGRES_USER: aiagent
+      POSTGRES_PASSWORD: aiagent123
+      POSTGRES_DB: aiagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ===== Elasticsearch =====
+  elasticsearch:
+    container_name: elasticsearch
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/elasticsearch:8.17.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ===== Kafka =====
+  zookeeper:
+    container_name: zookeeper
+    image: docker.1ms.run/confluentinc/cp-zookeeper:7.8.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zk_data:/var/lib/zookeeper/data
+
+  kafka:
+    container_name: kafka
+    image: docker.1ms.run/confluentinc/cp-kafka:7.8.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  pg_data:
+  es_data:
+  zk_data:
+  kafka_data:
