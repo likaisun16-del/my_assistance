@@ -20,7 +20,7 @@ from config.config import APIConfig
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient, Message
 from internal.memory.memory import ShortTerm, LongTerm, Preference, Item
-from internal.rag.rag import Engine as RAGEngine, SearchResult
+from internal.rag.rag import Engine as RAGEngine
 from internal.tools.tools import Tool, CallResult, default_tools, ToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ class UnifiedAgent:
 
     # ─────────────────────────────── 智能路由 ────────────────────────────
 
-    def route(self, user_input: str) -> str:
+    def route(self, user_input: str, use_rag: bool = False) -> str:
         """根据用户输入智能路由到不同处理模块"""
         # 1. 检查是否需要 ReAct（复杂任务）
         if self._needs_react(user_input):
@@ -110,8 +110,8 @@ class UnifiedAgent:
         if tool_name:
             return self._tool_flow(tool_name, user_input)
 
-        # 3. 检查 RAG 是否可用
-        if self.rag.loaded:
+        # 3. 检查 RAG 是否可用（根据 use_rag 参数或自动检测）
+        if use_rag or (not use_rag is False and self.rag.loaded):
             answer, _ = self.rag.query(user_input)
             return answer
 

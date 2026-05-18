@@ -776,12 +776,13 @@ zone.addEventListener('drop', async e => {
 });
 
 async function uploadFile(file) {
-  const text = await file.text();
   try {
+    const formData = new FormData();
+    formData.append('file', file);
+
     const res = await fetch('/api/upload', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: text })
+      body: formData
     }).then(r => r.json());
 
     const doc = { name: file.name, chunks: res.chunk_count, ts: Date.now() };
@@ -800,7 +801,7 @@ function renderDocs() {
     <div class="doc-item">
       <span class="doc-icon">✓</span>
       <span class="doc-name" title="${d.name}">${d.name}</span>
-      <span class="doc-chunks">${d.chunks} 块</span>
+      <span class="doc-chunks">${d.chunks || 0} 块</span>
     </div>`).join('');
 }
 

@@ -29,6 +29,12 @@ try:
 except ImportError:
     _HAS_KAFKA = False
 
+try:
+    from pymilvus import MilvusClient
+    _HAS_MILVUS = True
+except ImportError:
+    _HAS_MILVUS = False
+
 
 @dataclass
 class Status:
@@ -55,12 +61,12 @@ class Infrastructure:
         self._pg = None
         self._es = None
         self._kafka_producer = None
+        self._milvus = None
 
         self._connect_postgres()
         self._connect_es()
         self._connect_kafka()
-        # Milvus 暂用内存向量库，连接逻辑预留
-        self.ready.milvus = "memory-mode"
+        self._connect_milvus()
 
     # ─────────────────────────────── PostgreSQL ───────────────────────────────
 
@@ -218,6 +224,19 @@ class Infrastructure:
             logger.warning("⚠️  RAG chunk 保存失败: %s", e)
             return -1
 
+    def count_rag_chunks(self) -> int:
+        """统计知识库中的文档数量"""
+        if not self._pg:
+            return 0
+        try:
+            with self._pg.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM rag_chunks")
+                row = cur.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.warning("⚠️  统计 RAG chunks 失败: %s", e)
+            return 0
+
     def load_rag_chunks_by_ids(self, ids: List[int]) -> List[dict]:
         if not self._pg or not ids:
             return []
@@ -359,19 +378,101 @@ class Infrastructure:
         else:
             logger.info("📋 [Kafka-fallback] %s: %s", event_type, payload)
 
-    # ─────────────────────────────── Milvus（内存模式）───────────────────────
+    # ─────────────────────────────── Milvus ───────────────────────────────────
+
+    def _connect_milvus(self):
+        if not _HAS_MILVUS:
+            logger.warning("⚠️  pymilvus 未安装，Milvus 不可用")
+            self.ready.milvus = "memory-mode"
+            return
+        if not self.cfg.milvus_host or not self.cfg.milvus_port:
+            logger.warning("⚠️  Milvus 未配置")
+            self.ready.milvus = "memory-mode"
+            return
+        try:
+            uri = f"http://{self.cfg.milvus_host}:{self.cfg.milvus_port}"
+            self._milvus = MilvusClient(uri=uri)
+            # 测试连接
+            self._milvus.has_collection("test")
+            self.ready.milvus = "connected"
+            logger.info("✅ Milvus 已连接: %s", uri)
+            self._init_milvus_collections()
+        except Exception as e:
+            logger.warning("⚠️  Milvus 连接失败: %s (降级到内存模式)", e)
+            self._milvus = None
+            self.ready.milvus = "memory-mode"
+
+    def _init_milvus_collections(self):
+        if not self._milvus:
+            return
+        try:
+            if not self._milvus.has_collection("rag_embeddings"):
+                self._milvus.create_collection(
+                    collection_name="rag_embeddings",
+                    dimension=1024,
+                    auto_id=True,
+                    enable_dynamic_field=True,
+                )
+                logger.info("✅ Milvus 集合 rag_embeddings 已创建")
+        except Exception as e:
+            logger.warning("⚠️  Milvus 创建集合失败: %s", e)
 
     def milvus_search_with_scores(self, collection_name: str, query_emb: List[float], top_k: int) -> List[dict]:
-        """内存模式下的向量检索"""
-        return []
+        """向量检索"""
+        if not self._milvus:
+            return []
+        try:
+            results = self._milvus.search(
+                collection_name=collection_name,
+                data=[query_emb],
+                limit=top_k,
+                output_fields=["pg_id", "content"],
+            )
+            hits = []
+            for result in results[0]:
+                hits.append({
+                    "pg_id": result.get("entity", {}).get("pg_id"),
+                    "content": result.get("entity", {}).get("content"),
+                    "score": result.get("distance", 0.0),
+                })
+            return hits
+        except Exception as e:
+            logger.warning("⚠️  Milvus 检索失败: %s", e)
+            return []
 
     def insert_rag_chunks(self, pg_ids: List[int], contents: List[str], embeddings: List[List[float]]):
-        """内存模式下插入向量"""
-        pass
+        """插入向量"""
+        if not self._milvus:
+            return
+        try:
+            entities = []
+            for pg_id, content, emb in zip(pg_ids, contents, embeddings):
+                entities.append({
+                    "pg_id": pg_id,
+                    "content": content,
+                    "vector": emb,
+                })
+            self._milvus.insert(
+                collection_name="rag_embeddings",
+                data=entities,
+            )
+        except Exception as e:
+            logger.warning("⚠️  Milvus 插入失败: %s", e)
 
     def delete_rag_chunks_from_milvus(self, pg_ids: List[int]):
-        """内存模式下删除向量"""
-        pass
+        """删除向量"""
+        if not self._milvus:
+            return
+        try:
+            for pg_id in pg_ids:
+                self._milvus.delete(
+                    collection_name="rag_embeddings",
+                    filter=f"pg_id == {pg_id}",
+                )
+        except Exception as e:
+            logger.warning("⚠️  Milvus 删除失败: %s", e)
+
+    
 
     # ─────────────────────────────── 生命周期 ────────────────────────────────
 
