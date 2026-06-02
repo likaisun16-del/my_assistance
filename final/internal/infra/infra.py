@@ -225,7 +225,7 @@ class Infrastructure:
             return -1
 
     def count_rag_chunks(self) -> int:
-        """统计知识库中的文档数量"""
+        """统计知识库中的切片数量"""
         if not self._pg:
             return 0
         try:
@@ -392,8 +392,6 @@ class Infrastructure:
         try:
             uri = f"http://{self.cfg.milvus_host}:{self.cfg.milvus_port}"
             self._milvus = MilvusClient(uri=uri)
-            # 测试连接
-            self._milvus.has_collection("test")
             self.ready.milvus = "connected"
             logger.info("✅ Milvus 已连接: %s", uri)
             self._init_milvus_collections()
