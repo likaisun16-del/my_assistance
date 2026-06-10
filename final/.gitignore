@@ -1,14 +1,24 @@
-# Go 编译产物
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-/final-agent
+# Python 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# 测试缓存
-*.test
-*.out
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 覆盖率
+.coverage
+htmlcov/
 
 # IDE
 .idea/
@@ -16,5 +26,16 @@
 *.swp
 *.swo
 
-# macOS
+# macOS / Windows
 .DS_Store
+Thumbs.db
+
+# 日志 / 临时
+*.log
+*.tmp
+*.bak
+
+# 含密钥的本地配置
+config/config.local.yaml
+.env
+.env.*

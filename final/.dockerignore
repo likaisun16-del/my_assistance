@@ -1,5 +1,21 @@
-# 编译产物（保留 final-agent，Docker 需要拷贝）
-*.exe
+# Python 缓存（不进镜像）
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境（在容器里重装）
+.venv/
+venv/
+env/
+ENV/
+
+# 文档与杂项
+*.md
+docs/
 
 # IDE
 .idea/
@@ -13,3 +29,11 @@ Thumbs.db
 # Git
 .git/
 .gitignore
+
+# 日志
+*.log
+
+# 本地敏感配置
+config/config.local.yaml
+.env
+.env.*

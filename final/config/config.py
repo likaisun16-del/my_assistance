@@ -1,11 +1,14 @@
 # config — 配置管理（与主分支 Go 版字段对齐的 Python 配置骨架）
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# 项目根目录（final/）：本文件位于 final/config/config.py
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class APIConfig:
@@ -66,6 +69,7 @@ class APIConfig:
 
         # Server
         self.server_port = "8080"
+        self.cors_origins: List[str] = []
 
     def is_real_llm(self) -> bool:
         return bool(self.llm_api_key)
@@ -89,10 +93,27 @@ def _read_yaml(path: str) -> Dict[str, Any]:
         return {}
 
 
-def default_config() -> APIConfig:
-    """从 `config/config.yaml` 加载配置。"""
+def _resolve_config_path(explicit: Optional[str]) -> str:
+    """按优先级找 config.yaml：参数 > 环境变量 > 项目根 > cwd。"""
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    env = os.environ.get("AGI_CONFIG")
+    if env:
+        candidates.append(env)
+    candidates.append(os.path.join(PROJECT_ROOT, "config", "config.yaml"))
+    candidates.append("config/config.yaml")
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return candidates[-1]
+
+
+def default_config(config_path: Optional[str] = None) -> APIConfig:
+    """从 config.yaml 加载配置（路径与 cwd 解耦）。"""
     c = APIConfig()
-    data = _read_yaml("config/config.yaml")
+    path = _resolve_config_path(config_path)
+    data = _read_yaml(path)
 
     if llm := data.get("llm"):
         c.llm_api_url = llm.get("api_url", "")
@@ -157,6 +178,7 @@ def default_config() -> APIConfig:
 
     if server := data.get("server"):
         c.server_port = server.get("port", "8080")
+        c.cors_origins = server.get("cors_origins", []) or []
 
     if c.rrf_constant_k <= 0:
         c.rrf_constant_k = 60

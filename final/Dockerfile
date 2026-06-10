@@ -1,18 +1,37 @@
-# ===== 本地预编译 + 轻量运行镜像 =====
-# 不在 Docker 中编译，避免拉取 golang 大镜像
-# 本地编译命令: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -C . -ldflags="-s -w" -o final-agent .
+# ===== Python 运行镜像 =====
+FROM python:3.11-slim
 
-FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/alpine:3.19
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Shanghai
 
-RUN apk add --no-cache ca-certificates tzdata curl \
-    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+# 系统依赖：tzdata + psycopg2-binary 运行时所需的 libpq、curl 用于 healthcheck
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
 WORKDIR /app
 
-COPY final-agent .
+# 先装依赖以便利用 Docker 层缓存
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 拷贝源码
+COPY config/ ./config/
+COPY internal/ ./internal/
+COPY main.py ./
 COPY frontend/ ./frontend/
 
-EXPOSE 8090
+ENV FRONTEND_DIR=/app/frontend \
+    AGI_CONFIG=/app/config/config.yaml
 
-ENTRYPOINT ["/app/final-agent"]
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["python", "-u", "main.py"]

@@ -1,7 +1,7 @@
 # Final Stage — 全阶段整合 AI 助手（Python 版）
 #
-# 这是当前 python 分支的启动入口：
-# - 读取配置
+# 启动入口：
+# - 加载配置（路径与 cwd 解耦）
 # - 初始化基础设施
 # - 构建统一智能体
 # - 注册 HTTP 路由
@@ -10,12 +10,18 @@ import logging
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# 把项目根（final/）加入 sys.path，让 `config.config` / `internal.*` 可被绝对导入
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from config.config import default_config
-from internal.agent.agent import UnifiedAgent
-from internal.handler.handler import setup_routes
-from internal.infra.infra import Infrastructure
+# 默认前端目录指向 final/frontend，避免 cwd 不在项目根时挂载失败
+os.environ.setdefault("FRONTEND_DIR", os.path.join(PROJECT_ROOT, "frontend"))
+
+from config.config import default_config  # noqa: E402
+from internal.agent.agent import UnifiedAgent  # noqa: E402
+from internal.handler.handler import setup_routes  # noqa: E402
+from internal.infra.infra import Infrastructure  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,

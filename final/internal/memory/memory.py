@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -23,7 +24,7 @@ class ShortTerm:
     """短期记忆 - 滑动窗口存储最近 N 轮对话。"""
 
     def __init__(self, max_turns: int = 10):
-        self.max_turns = max_turns
+        self.max_turns = max(1, max_turns)
         self.messages: List[Dict[str, str]] = []
 
     def add(self, role: str, content: str):
@@ -41,6 +42,28 @@ class ShortTerm:
         return len(self.messages)
 
 
+def _tokenize_zh(text: str) -> List[str]:
+    """中英文混合分词：中文按字、英文/数字按词。"""
+    tokens: List[str] = []
+    word = ""
+    for ch in text:
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF:
+            if word:
+                tokens.append(word.lower())
+                word = ""
+            tokens.append(ch)
+        elif ch.isalnum():
+            word += ch
+        else:
+            if word:
+                tokens.append(word.lower())
+                word = ""
+    if word:
+        tokens.append(word.lower())
+    return tokens
+
+
 class LongTerm:
     """长期记忆 - 基于 embedding 的语义记忆。"""
 
@@ -49,6 +72,8 @@ class LongTerm:
         self.inf = inf
         self.items: List[Item] = []
         self._embed_fn: Optional[Any] = None
+        self._last_consolidate_ts = 0.0
+        self._items_since_last = 0
 
     def set_embed_fn(self, fn):
         self._embed_fn = fn
@@ -68,22 +93,9 @@ class LongTerm:
 
         item = Item(content=content, importance=importance, embedding=embedding)
         self.items.append(item)
+        self._items_since_last += 1
         emb_json = json.dumps(embedding) if embedding else "null"
         self.inf.save_long_term_item(content, importance, emb_json)
-
-    def store(self, content: str, importance: float, embedding: Optional[List[float]]) -> bool:
-        """兼容主分支命名的存储接口。"""
-        try:
-            self.items.append(Item(content=content, importance=importance, embedding=embedding))
-            self.inf.save_long_term_item(content, importance, json.dumps(embedding) if embedding else "null")
-            return True
-        except Exception as e:
-            logger.warning("⚠️  长期记忆存储失败: %s", e)
-            return False
-
-    def sync_last_item_pgid(self, pg_id: int):
-        """兼容主分支的 PGID 同步接口，Python 版默认不需要。"""
-        return
 
     def recall(self, query: str, top_k: int = 3) -> List[Item]:
         if not self.items:
@@ -95,20 +107,20 @@ class LongTerm:
                 query_emb = self._embed_fn(query)
             except Exception as e:
                 logger.warning("⚠️  查询向量化失败: %s", e)
-                return []
+                query_emb = None
 
         if not query_emb:
             return self.items[:top_k]
 
-        results = []
+        scored: List[tuple] = []
         for item in self.items:
             if item.embedding:
                 sim = self._cosine_similarity(query_emb, item.embedding)
                 score = sim * 0.7 + item.importance * 0.3
-                results.append((item, score))
+                scored.append((item, score))
 
-        results.sort(key=lambda x: x[1], reverse=True)
-        return [item for item, score in results[:top_k] if score >= 0.4]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [item for item, score in scored[:top_k] if score >= 0.4]
 
     def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
         if len(a) != len(b):
@@ -121,16 +133,20 @@ class LongTerm:
         return dot / (na * nb)
 
     def need_consolidation(self) -> bool:
-        return len(self.items) >= max(1, self.cfg.memory_consolidation_trigger)
-
-    def NeedConsolidation(self) -> bool:
-        return self.need_consolidation()
+        return self._items_since_last >= max(1, self.cfg.memory_consolidation_trigger)
 
     def consolidate(self):
-        if len(self.items) < self.cfg.memory_consolidation_trigger:
+        """合并/去重 + 衰减 + TTL 淘汰。仅在 need_consolidation 为真时调用。"""
+        if not self.items:
             return
 
         logger.info("🔄 开始记忆合并...")
+        now = time.time()
+        elapsed_days = (now - self._last_consolidate_ts) / 86400.0 if self._last_consolidate_ts > 0 else 1.0
+        self._last_consolidate_ts = now
+        self._items_since_last = 0
+
+        # 1) 重复项合并：保留 importance 较高者
         to_remove = set()
         for i in range(len(self.items)):
             if i in to_remove:
@@ -140,22 +156,23 @@ class LongTerm:
                     continue
                 sim = self._compute_similarity(self.items[i].content, self.items[j].content)
                 if sim >= self.cfg.memory_consolidation_dedup:
-                    if self.items[i].importance < self.items[j].importance:
-                        to_remove.add(i)
-                    else:
-                        to_remove.add(j)
-
+                    drop = i if self.items[i].importance < self.items[j].importance else j
+                    to_remove.add(drop)
         self.items = [item for i, item in enumerate(self.items) if i not in to_remove]
 
+        # 2) 按时间间隔衰减（避免每轮对话都被衰减一次）
+        decay = self.cfg.memory_consolidation_decay_rate ** max(elapsed_days, 0.0)
         for item in self.items:
-            item.importance *= self.cfg.memory_consolidation_decay_rate
+            item.importance *= decay
 
+        # 3) TTL 淘汰
         self.items = [item for item in self.items if item.importance >= self.cfg.memory_consolidation_min_import]
         logger.info("✅ 记忆合并完成，剩余 %d 条", len(self.items))
 
     def _compute_similarity(self, a: str, b: str) -> float:
-        tokens_a = set(a.lower().split())
-        tokens_b = set(b.lower().split())
+        """中英文 Jaccard 相似度。"""
+        tokens_a = set(_tokenize_zh(a))
+        tokens_b = set(_tokenize_zh(b))
         if not tokens_a or not tokens_b:
             return 0.0
         return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
@@ -179,61 +196,17 @@ class Preference:
         logger.info("✅ 加载用户 %s 的偏好: %s", self.user_id, self.preferences)
 
     def set(self, key: str, value: str):
+        if not key or value is None:
+            return
         self.preferences[key] = value
         self.inf.save_preference(self.user_id, key, value)
 
     def save_batch(self, kvs: Dict[str, str]):
         for k, v in kvs.items():
-            self.set(k, v)
+            self.set(str(k), str(v))
 
     def get(self, key: str, default: str = "") -> str:
         return self.preferences.get(key, default)
 
     def get_all(self) -> Dict[str, str]:
         return self.preferences.copy()
-
-    def extract_and_save(self, content: str):
-        """兼容主分支风格：从单条内容中提取偏好并保存。"""
-        key, value = None, None
-        if not content:
-            return None, None, False
-        match = re.search(r"我叫\s*(\S+)", content)
-        if match:
-            key, value = "name", match.group(1)
-        else:
-            match = re.search(r"喜欢\s*(\S+)", content)
-            if match:
-                key, value = "like", match.group(1)
-        if key and value:
-            self.set(key, value)
-            return key, value, True
-        return None, None, False
-
-    def update_from_messages(self, messages: List[Dict[str, str]]):
-        extracted_info = []
-        for msg in messages:
-            content = msg.get("content", "")
-            if not content:
-                continue
-
-            if "我叫" in content:
-                match = re.search(r"我叫\s*(\S+)", content)
-                if match:
-                    self.set("name", match.group(1))
-                    extracted_info.append(f"name={match.group(1)}")
-
-            if "喜欢" in content:
-                match = re.search(r"喜欢\s*(\S+)", content)
-                if match:
-                    self.set("like", match.group(1))
-                    extracted_info.append(f"like={match.group(1)}")
-
-            if "讨厌" in content or "不喜欢" in content:
-                match = re.search(r"(讨厌|不喜欢)\s*(\S+)", content)
-                if match:
-                    self.set("dislike", match.group(2))
-                    extracted_info.append(f"dislike={match.group(2)}")
-
-        if extracted_info:
-            return "已记住：" + ", ".join(extracted_info)
-        return ""

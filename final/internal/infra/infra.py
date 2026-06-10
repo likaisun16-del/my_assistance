@@ -2,8 +2,8 @@
 # 每个连接失败时优雅降级，不影响应用启动。
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 from config.config import APIConfig
 
@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 # 尝试导入可选依赖，失败则标记不可用
 try:
     import psycopg2
-    import psycopg2.extras
     _HAS_PG = True
 except ImportError:
     _HAS_PG = False
@@ -160,6 +159,32 @@ class Infrastructure:
                 )
         except Exception as e:
             logger.warning("⚠️  快照保存到 PG 失败: %s", e)
+
+    def list_snapshots(self, limit: int = 50) -> List[dict]:
+        if not self._pg:
+            return []
+        try:
+            with self._pg.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id, state, created_at FROM task_snapshots ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = []
+                for task_id, state, created_at in cur.fetchall():
+                    if isinstance(state, str):
+                        try:
+                            state = json.loads(state)
+                        except Exception:
+                            pass
+                    rows.append({
+                        "task_id": task_id,
+                        "state": state,
+                        "created_at": created_at.isoformat() if created_at else None,
+                    })
+                return rows
+        except Exception as e:
+            logger.warning("⚠️  快照列表加载失败: %s", e)
+            return []
 
     def load_preferences(self, user_id: str) -> Dict[str, str]:
         result: Dict[str, str] = {}
@@ -403,15 +428,16 @@ class Infrastructure:
     def _init_milvus_collections(self):
         if not self._milvus:
             return
+        dim = int(self.cfg.rag_milvus_dim or 1024)
         try:
             if not self._milvus.has_collection("rag_embeddings"):
                 self._milvus.create_collection(
                     collection_name="rag_embeddings",
-                    dimension=1024,
+                    dimension=dim,
                     auto_id=True,
                     enable_dynamic_field=True,
                 )
-                logger.info("✅ Milvus 集合 rag_embeddings 已创建")
+                logger.info("✅ Milvus 集合 rag_embeddings 已创建 (dim=%d)", dim)
         except Exception as e:
             logger.warning("⚠️  Milvus 创建集合失败: %s", e)
 
@@ -476,6 +502,23 @@ class Infrastructure:
 
     def close(self):
         if self._pg:
-            self._pg.close()
+            try:
+                self._pg.close()
+            except Exception as e:
+                logger.warning("⚠️  PG 关闭失败: %s", e)
         if self._kafka_producer:
-            self._kafka_producer.close()
+            try:
+                self._kafka_producer.flush()
+                self._kafka_producer.close()
+            except Exception as e:
+                logger.warning("⚠️  Kafka 关闭失败: %s", e)
+        if self._es:
+            try:
+                self._es.close()
+            except Exception as e:
+                logger.warning("⚠️  ES 关闭失败: %s", e)
+        if self._milvus:
+            try:
+                self._milvus.close()
+            except Exception as e:
+                logger.warning("⚠️  Milvus 关闭失败: %s", e)

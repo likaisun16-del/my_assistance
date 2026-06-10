@@ -25,7 +25,7 @@ class CallResult:
 
 # ─────────────────────────────── 内置工具 ────────────────────────────────
 
-def get_time(args: Dict[str, str]) -> str:
+def get_time(_args: Dict[str, str]) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
@@ -114,28 +114,6 @@ class ToolExecutor:
     def add_tool(self, tool: Tool):
         self.tools.append(tool)
         self._tool_map[tool.name] = tool
-
-
-# ─────────────────────────────── 工具选择器 ──────────────────────────────
-
-def decide(query: str, tools: List[Tool]) -> Optional[str]:
-    query_lower = query.lower()
-    tool_triggers = {
-        "时间": "get_time",
-        "几点": "get_time",
-        "现在": "get_time",
-        "天气": "get_weather",
-        "搜索": "search_web",
-        "查找": "search_web",
-        "知识": "rag_search",
-        "文档": "rag_search",
-    }
-
-    available = {t.name for t in tools}
-    for trigger, tool_name in tool_triggers.items():
-        if trigger in query_lower and tool_name in available:
-            return tool_name
-    return None
 
 
 # ─────────────────────────────── MCP 工具 ────────────────────────────────

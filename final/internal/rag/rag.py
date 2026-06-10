@@ -1,8 +1,8 @@
-# rag — 检索增强生成（Retrieval-Augmented Generation）
+# rag — 检索增强生成（RAG）：Milvus 语义 + ES BM25 + RRF 融合
 import json
 import logging
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from config.config import APIConfig
 from internal.infra.infra import Infrastructure
@@ -17,44 +17,41 @@ class Chunk:
     content: str
 
 
-@dataclass
-class SearchResult:
-    chunk: Chunk
-    similarity: float
-
-
 class TextSplitter:
     """按字符窗口切分文本。"""
 
     def __init__(self, chunk_size: int = 200, overlap: int = 50):
-        self.chunk_size = chunk_size
-        self.overlap = overlap
+        self.chunk_size = max(1, chunk_size)
+        self.overlap = max(0, min(overlap, self.chunk_size - 1))
 
     def split(self, text: str) -> List[Chunk]:
+        if not text:
+            return []
         step = self.chunk_size - self.overlap
-        if step <= 0:
-            step = self.chunk_size
         chunks: List[Chunk] = []
         idx = 0
-        for i in range(0, len(text), step):
-            end = i + self.chunk_size
+        i = 0
+        while i < len(text):
+            end = min(i + self.chunk_size, len(text))
             chunks.append(Chunk(id=idx, content=text[i:end]))
             idx += 1
             if end >= len(text):
                 break
+            i += step
         return chunks
 
 
 class Engine:
-    """Python 版 RAG 引擎：切分、入库、检索、生成。"""
+    """RAG 引擎：切分 → 入库（PG/Milvus/ES） → 检索（RRF 融合） → LLM 合成。"""
 
-    def __init__(self, cfg: APIConfig, inf: Infrastructure):
+    def __init__(self, cfg: APIConfig, inf: Infrastructure, llm: Optional[LLMClient] = None):
         self.cfg = cfg
         self.inf = inf
         self.splitter = TextSplitter(cfg.chunk_size, cfg.chunk_overlap)
         self.loaded = False
         self._generate_fn: Optional[Callable[[str, str], str]] = None
-        self._llm = LLMClient(cfg)
+        # 复用 agent 注入的 LLM 客户端，避免重复实例
+        self._llm = llm if llm is not None else LLMClient(cfg)
         self._check_existing_chunks()
 
     def set_generate_fn(self, fn: Callable[[str, str], str]):
@@ -68,6 +65,8 @@ class Engine:
         except Exception as e:
             logger.error("检查知识库文档失败: %s", e)
 
+    # ── 入库 ────────────────────────────────────────────────────────────────
+
     def ingest(self, doc: str) -> int:
         chunks = self.splitter.split(doc)
         if not chunks:
@@ -77,66 +76,120 @@ class Engine:
         embeddings = [self._llm.embed(content) for content in contents]
 
         pg_ids: List[int] = []
+        valid_contents: List[str] = []
+        valid_embeddings: List[List[float]] = []
         doc_hash = f"doc_{abs(hash(doc))}"
         for i, chunk in enumerate(chunks):
             pg_id = self.inf.save_rag_chunk(doc_hash, i, chunk.content, json.dumps(embeddings[i]))
             if pg_id > 0:
                 pg_ids.append(pg_id)
+                valid_contents.append(chunk.content)
+                valid_embeddings.append(embeddings[i])
 
-        if self.inf.ready.milvus == "connected" and pg_ids:
-            self.inf.insert_rag_chunks(pg_ids, contents, embeddings)
+        # 仅在 Milvus 真实连接 + embedding 维度匹配时才插入
+        if (
+            self.inf.ready.milvus == "connected"
+            and pg_ids
+            and self._llm.cfg.is_real_embedding()
+            and valid_embeddings
+            and len(valid_embeddings[0]) == self.cfg.rag_milvus_dim
+        ):
+            self.inf.insert_rag_chunks(pg_ids, valid_contents, valid_embeddings)
 
         for i, pg_id in enumerate(pg_ids):
-            self.inf.index_rag_chunk(pg_id, chunks[i].content, doc_hash, i)
+            self.inf.index_rag_chunk(pg_id, valid_contents[i], doc_hash, i)
 
         self.loaded = True
         self.inf.publish_event("rag.ingest", json.dumps({"chunk_count": len(chunks)}))
         return len(chunks)
 
-    def query(self, question: str) -> tuple:
+    # ── 检索 ────────────────────────────────────────────────────────────────
+
+    def query(self, question: str) -> Tuple[str, List[dict]]:
         if self.inf.ready.postgresql != "connected":
             return "PostgreSQL 未连接，无法查询知识库。", []
 
-        query_emb = self._llm.embed(question)
+        top_k = max(1, self.cfg.top_k)
 
-        milvus_results = []
-        if self.inf.ready.milvus == "connected":
-            milvus_results = self.inf.milvus_search_with_scores("rag_embeddings", query_emb, self.cfg.top_k)
+        # 仅当 Milvus 真实连接且 embedding 真实可用时使用语义路
+        milvus_results: List[dict] = []
+        if self.inf.ready.milvus == "connected" and self._llm.cfg.is_real_embedding():
+            try:
+                query_emb = self._llm.embed(question)
+                if query_emb and len(query_emb) == self.cfg.rag_milvus_dim:
+                    milvus_results = self.inf.milvus_search_with_scores(
+                        "rag_embeddings", query_emb, top_k * 2
+                    )
+            except Exception as e:
+                logger.warning("⚠️  Milvus 语义检索失败: %s", e)
 
-        es_results = []
+        es_results: List[dict] = []
         if self.inf.ready.elasticsearch == "connected":
-            es_results = self.inf.search_rag_chunks(question, self.cfg.top_k)
+            es_results = self.inf.search_rag_chunks(question, top_k * 2)
 
-        all_results = {}
-        for r in milvus_results:
-            pg_id = r.get("pg_id")
-            if pg_id:
-                all_results[pg_id] = {"content": r.get("content", ""), "score": r.get("score", 0.0), "source": "milvus"}
-
-        for r in es_results:
-            pg_id = r.get("pg_id")
-            if not pg_id:
-                continue
-            if pg_id in all_results:
-                all_results[pg_id]["score"] = (all_results[pg_id]["score"] + r.get("score", 0.0) * 0.5) / 1.5
-            else:
-                all_results[pg_id] = {"content": r.get("content", ""), "score": r.get("score", 0.0), "source": "es"}
-
-        sorted_results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
-        top_results = sorted_results[: self.cfg.top_k]
-        if not top_results:
+        fused = self._rrf_fuse(milvus_results, es_results, top_k)
+        if not fused:
             return "知识库中未找到相关内容。", []
 
-        context = "\n\n".join([r["content"] for r in top_results if r["score"] > 0.01])
+        context = "\n\n".join(r["content"] for r in fused if r.get("content"))
         if not context:
             return "知识库中未找到相关内容。", []
 
         if self._generate_fn:
-            system_prompt = "你是一个基于知识库回答问题的助手。请仅根据提供的上下文内容回答问题，不要编造信息。如果上下文不足以回答，请说明。"
+            system_prompt = (
+                "你是一个基于知识库回答问题的助手。请仅根据提供的上下文内容回答问题，"
+                "不要编造信息。如果上下文不足以回答，请说明。"
+            )
             user_msg = f"上下文：\n{context}\n\n问题：{question}"
-            return self._generate_fn(system_prompt, user_msg), top_results
+            return self._generate_fn(system_prompt, user_msg), fused
 
-        return f"【知识库检索结果】\n{context}", top_results
+        return f"【知识库检索结果】\n{context}", fused
 
-    def get_chunks(self) -> List[Chunk]:
-        return []
+    def _rrf_fuse(
+        self,
+        milvus_results: List[dict],
+        es_results: List[dict],
+        top_k: int,
+    ) -> List[dict]:
+        """Reciprocal Rank Fusion: score(d) = Σ 1/(k + rank_i(d))。"""
+        k = self.cfg.rrf_constant_k if self.cfg.rrf_constant_k > 0 else 60
+
+        # key 用 pg_id 优先，回退到 content 前缀
+        merged: Dict[str, dict] = {}
+        scores: Dict[str, float] = {}
+
+        def _key(item: dict) -> str:
+            pg_id = item.get("pg_id")
+            if pg_id is not None:
+                return f"id:{pg_id}"
+            return f"c:{(item.get('content') or '')[:100]}"
+
+        for rank, item in enumerate(milvus_results):
+            key = _key(item)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            if key not in merged:
+                merged[key] = {
+                    "pg_id": item.get("pg_id"),
+                    "content": item.get("content", ""),
+                    "score": 0.0,
+                    "source": "milvus",
+                }
+
+        for rank, item in enumerate(es_results):
+            key = _key(item)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            if key not in merged:
+                merged[key] = {
+                    "pg_id": item.get("pg_id"),
+                    "content": item.get("content", ""),
+                    "score": 0.0,
+                    "source": "es",
+                }
+            else:
+                merged[key]["source"] = "hybrid"
+
+        for key, item in merged.items():
+            item["score"] = scores[key]
+
+        sorted_items = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+        return sorted_items[:top_k]
