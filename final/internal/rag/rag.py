@@ -1,12 +1,14 @@
-# rag — 检索增强生成（RAG）：Milvus 语义 + ES BM25 + RRF 融合
+# rag — 检索增强生成（RAG）：Milvus 语义 + ES BM25 + Neo4j 图 + 三路 RRF 融合
 import json
 import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config.config import APIConfig
+from internal.graph.kgstore import KGStore
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient
+from internal.rag.hybrid import HybridStore
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +54,22 @@ class Engine:
         self._generate_fn: Optional[Callable[[str, str], str]] = None
         # 复用 agent 注入的 LLM 客户端，避免重复实例
         self._llm = llm if llm is not None else LLMClient(cfg)
+        # 三路混合检索（Milvus + ES + KG），由 cfg.enable_hybrid_search 控制是否启用
+        self._hybrid: Optional[HybridStore] = None
+        if getattr(cfg, "enable_hybrid_search", False):
+            self._hybrid = HybridStore(cfg, inf, embed_fn=self._llm.embed)
         self._check_existing_chunks()
 
     def set_generate_fn(self, fn: Callable[[str, str], str]):
         self._generate_fn = fn
+
+    def set_kg_store(self, kg: Optional[KGStore]) -> None:
+        """注入知识图谱存储（图路检索的第三路）。
+
+        必须在 cfg.enable_hybrid_search=True 时才生效；否则仅记录但不影响单路检索。
+        """
+        if self._hybrid is not None:
+            self._hybrid.set_kg_store(kg)
 
     def _check_existing_chunks(self):
         try:
@@ -111,6 +125,26 @@ class Engine:
 
         top_k = max(1, self.cfg.top_k)
 
+        # 优先走三路混合检索（开关：cfg.enable_hybrid_search）。
+        # 仅在 ES + Milvus 都连接时启用，否则降级到单路语义/关键词或老 RRF 路径。
+        if (
+            self._hybrid is not None
+            and self.inf.ready.elasticsearch == "connected"
+            and self.inf.ready.milvus == "connected"
+            and self._llm.cfg.is_real_embedding()
+        ):
+            hybrid_hits = self._hybrid.search(question, top_k)
+            fused = [
+                {
+                    "pg_id": h.pg_id,
+                    "content": h.content,
+                    "score": h.score,
+                    "source": h.source,
+                }
+                for h in hybrid_hits
+            ]
+            return self._compose_answer(question, fused)
+
         # 仅当 Milvus 真实连接且 embedding 真实可用时使用语义路
         milvus_results: List[dict] = []
         if self.inf.ready.milvus == "connected" and self._llm.cfg.is_real_embedding():
@@ -128,6 +162,9 @@ class Engine:
             es_results = self.inf.search_rag_chunks(question, top_k * 2)
 
         fused = self._rrf_fuse(milvus_results, es_results, top_k)
+        return self._compose_answer(question, fused)
+
+    def _compose_answer(self, question: str, fused: List[dict]) -> Tuple[str, List[dict]]:
         if not fused:
             return "知识库中未找到相关内容。", []
 

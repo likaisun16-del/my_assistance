@@ -49,6 +49,14 @@ class MCPRegisterRequest(BaseModel):
     params: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class DocsDeleteRequest(BaseModel):
+    doc_hash: str = Field(..., min_length=1)
+
+
+class UploadJSONRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+
+
 # ─── 工具函数 ───────────────────────────────────────────────────────────────
 
 def extract_text_from_file(file: UploadFile, content: bytes) -> str:
@@ -136,6 +144,28 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
             raise
         except Exception as e:
             logger.error("聊天接口错误: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/chat/cancel")
+    async def chat_cancel():
+        try:
+            agent.cancel()
+            return {"ok": True, "message": "已发送取消信号"}
+        except Exception as e:
+            logger.error("取消失败: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/docs/delete")
+    async def docs_delete(req: DocsDeleteRequest):
+        try:
+            rag = getattr(agent, "rag", None)
+            if rag and hasattr(rag, "delete"):
+                rag.delete(req.doc_hash)
+            return {"ok": True, "doc_hash": req.doc_hash}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("删除文档失败: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/api/upload")

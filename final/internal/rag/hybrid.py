@@ -1,0 +1,329 @@
+# hybrid — 企业级混合检索：Milvus 语义 + ES BM25 + Neo4j 知识图谱 + 三路 RRF 融合
+#
+# 三路 score 来自 reciprocal rank fusion（基于 rank，不依赖原始分尺度）：
+#     score(d) = Σ_i  weight_i / (k + rank_i(d))
+# 权重：semantic_weight、(1 - semantic_weight - kg_weight)、kg_weight，
+# 任一路不可用 / 失败时跳过并把剩余权重重新归一，避免某一路因不可用拉低融合分数。
+import logging
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
+
+from config.config import APIConfig
+from internal.graph.kgstore import KGStore
+from internal.infra.infra import Infrastructure
+
+logger = logging.getLogger(__name__)
+
+
+# Embedding 回调签名：text -> List[float]
+EmbedFn = Callable[[str], List[float]]
+
+
+@dataclass
+class HybridResult:
+    """混合检索的单条结果（与 Go 版 HybridResult 字段对齐）"""
+    pg_id: int = 0
+    content: str = ""
+    score: float = 0.0
+    source: str = ""  # "hybrid" | "semantic" | "keyword"
+
+
+@dataclass
+class _PathHits:
+    """单路检索结果（rank 顺序）+ 是否成功"""
+    hits: List[dict] = field(default_factory=list)
+    ok: bool = False
+
+
+class HybridStore:
+    """企业级混合检索：
+        - Milvus 语义向量检索
+        - Elasticsearch BM25 关键词检索
+        - Neo4j 知识图谱实体遍历检索
+        - Reciprocal Rank Fusion 三路融合
+
+    根据基础设施可用性自动选择检索模式：
+        hybrid / semantic / keyword / unavailable
+    """
+
+    def __init__(
+        self,
+        cfg: APIConfig,
+        inf: Infrastructure,
+        embed_fn: Optional[EmbedFn] = None,
+        kg: Optional[KGStore] = None,
+    ):
+        self.cfg = cfg
+        self.inf = inf
+        self._embed_fn = embed_fn
+        self._kg = kg
+        self.mode = self._resolve_mode()
+
+    # ─── 注入式 setter（与 Go 版接口对齐） ─────────────────────────────────
+
+    def set_embed_fn(self, fn: EmbedFn) -> None:
+        self._embed_fn = fn
+
+    def set_kg_store(self, kg: Optional[KGStore]) -> None:
+        self._kg = kg
+
+    # ─── 基础设施可用性 ──────────────────────────────────────────────────
+
+    def _milvus_ok(self) -> bool:
+        return self.inf.ready.milvus == "connected"
+
+    def _es_ok(self) -> bool:
+        return self.inf.ready.elasticsearch == "connected"
+
+    def _kg_ok(self) -> bool:
+        return self._kg is not None and self._kg.available()
+
+    def _resolve_mode(self) -> str:
+        m, e = self._milvus_ok(), self._es_ok()
+        if m and e:
+            return "hybrid"
+        if m:
+            return "semantic"
+        if e:
+            return "keyword"
+        return "unavailable"
+
+    # ─── 入口 ───────────────────────────────────────────────────────────
+
+    def search(self, query: str, top_k: int) -> List[HybridResult]:
+        # 模式可能在运行时变化（连接恢复），每次入口重新判定
+        self.mode = self._resolve_mode()
+        if self.mode == "hybrid":
+            return self._search_hybrid(query, top_k)
+        if self.mode == "semantic":
+            return self._search_semantic(query, top_k)
+        if self.mode == "keyword":
+            return self._search_keyword(query, top_k)
+        logger.warning("⚠️  检索基础设施不可用（Milvus 和 ES 均未连接）")
+        return []
+
+    # ─── 混合检索：三路 RRF 融合 ─────────────────────────────────────────
+
+    def _search_hybrid(self, query: str, top_k: int) -> List[HybridResult]:
+        # 从每路取 2*top_k，给融合留候选（与 Go 版一致，下限 10）
+        fetch_k = max(top_k * 2, 10)
+
+        milvus_path = self._fetch_milvus(query, fetch_k)
+        es_path = self._fetch_es(query, fetch_k)
+        kg_path = self._fetch_kg(query, fetch_k)
+
+        # 三路全失败 → 直接返回；保留 Go 版的两两降级路径
+        if not milvus_path.ok and not es_path.ok and not kg_path.ok:
+            logger.warning("⚠️  三路检索均失败")
+            return []
+        if not milvus_path.ok and not es_path.ok:
+            # 仅图路成功，沿用图路 chunks
+            return self._materialize_kg_only(kg_path.hits, top_k)
+        if not milvus_path.ok:
+            logger.warning("⚠️  Milvus 检索失败，降级到关键词检索")
+            return self._search_keyword(query, top_k)
+        if not es_path.ok:
+            logger.warning("⚠️  ES 检索失败，降级到语义检索")
+            return self._search_semantic(query, top_k)
+
+        # 计算可用权重（KG 不可用时把权重重新归一到剩余两路）
+        sem_w, kw_w, kg_w = self._normalized_weights(kg_path.ok)
+
+        # RRF 常数 k
+        k = self.cfg.rrf_constant_k if self.cfg.rrf_constant_k > 0 else 60
+
+        rrf_scores: Dict[int, float] = {}
+
+        for rank, hit in enumerate(milvus_path.hits):
+            pg_id = hit.get("pg_id")
+            if pg_id is None:
+                continue
+            rrf_scores[pg_id] = rrf_scores.get(pg_id, 0.0) + sem_w / (k + rank + 1)
+
+        for rank, hit in enumerate(es_path.hits):
+            pg_id = hit.get("pg_id")
+            if pg_id is None:
+                continue
+            rrf_scores[pg_id] = rrf_scores.get(pg_id, 0.0) + kw_w / (k + rank + 1)
+
+        if kg_path.ok and kg_w > 0:
+            # KG 节点上已持久化 pg_id（kgstore.upsertEntity），直接累加到 rrf_scores
+            for rank, hit in enumerate(kg_path.hits):
+                pg_id = hit.pg_id if hasattr(hit, "pg_id") else hit.get("pg_id", 0)
+                if not pg_id:  # 老节点（升级前数据）没有 pg_id，跳过避免污染
+                    continue
+                rrf_scores[pg_id] = rrf_scores.get(pg_id, 0.0) + kg_w / (k + rank + 1)
+
+        # 排序 + 截断
+        sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        if len(sorted_ids) > top_k:
+            sorted_ids = sorted_ids[:top_k]
+        if not sorted_ids:
+            return []
+
+        # 从 PG 批量取回 chunk 内容
+        ids = [pid for pid, _ in sorted_ids]
+        rows = self.inf.load_rag_chunks_by_ids(ids)
+        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+
+        results: List[HybridResult] = []
+        for pid, score in sorted_ids:
+            content = content_map.get(pid)
+            if content is None:
+                continue
+            results.append(HybridResult(pg_id=pid, content=content, score=score, source="hybrid"))
+        return results
+
+    # ─── 单路：Milvus 语义 ───────────────────────────────────────────────
+
+    def _search_semantic(self, query: str, top_k: int) -> List[HybridResult]:
+        path = self._fetch_milvus(query, top_k)
+        if not path.ok:
+            return []
+        ids = [h["pg_id"] for h in path.hits if h.get("pg_id") is not None]
+        rows = self.inf.load_rag_chunks_by_ids(ids) if ids else []
+        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        results: List[HybridResult] = []
+        for h in path.hits:
+            pid = h.get("pg_id")
+            if pid is None:
+                continue
+            content = content_map.get(pid) or h.get("content") or ""
+            if not content:
+                continue
+            results.append(HybridResult(
+                pg_id=pid, content=content,
+                score=float(h.get("score", 0.0)), source="semantic",
+            ))
+        return results
+
+    # ─── 单路：ES BM25 ───────────────────────────────────────────────────
+
+    def _search_keyword(self, query: str, top_k: int) -> List[HybridResult]:
+        path = self._fetch_es(query, top_k)
+        if not path.ok:
+            return []
+        ids = [h["pg_id"] for h in path.hits if h.get("pg_id") is not None]
+        rows = self.inf.load_rag_chunks_by_ids(ids) if ids else []
+        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        results: List[HybridResult] = []
+        for h in path.hits:
+            pid = h.get("pg_id")
+            if pid is None:
+                continue
+            content = content_map.get(pid) or h.get("content") or ""
+            if not content:
+                continue
+            results.append(HybridResult(
+                pg_id=pid, content=content,
+                score=float(h.get("score", 0.0)), source="keyword",
+            ))
+        return results
+
+    # ─── 三路 fetch（统一 try/except，失败 → ok=False） ──────────────────
+
+    def _fetch_milvus(self, query: str, fetch_k: int) -> _PathHits:
+        if not self._milvus_ok():
+            return _PathHits(ok=False)
+        if self._embed_fn is None:
+            logger.warning("⚠️  embed_fn 未注入，跳过 Milvus 语义路")
+            return _PathHits(ok=False)
+        try:
+            query_emb = self._embed_fn(query)
+        except Exception as e:
+            logger.warning("⚠️  查询向量化失败: %s", e)
+            return _PathHits(ok=False)
+        if not query_emb:
+            return _PathHits(ok=False)
+        # 维度不匹配时跳过（与 rag.py 行为一致），避免 Milvus 服务端报错
+        if self.cfg.rag_milvus_dim and len(query_emb) != self.cfg.rag_milvus_dim:
+            logger.warning(
+                "⚠️  embedding 维度 %d 与 rag_milvus_dim=%d 不匹配，跳过语义路",
+                len(query_emb), self.cfg.rag_milvus_dim,
+            )
+            return _PathHits(ok=False)
+        try:
+            hits = self.inf.milvus_search_with_scores("rag_embeddings", query_emb, fetch_k) or []
+            return _PathHits(hits=hits, ok=True)
+        except Exception as e:
+            logger.warning("⚠️  Milvus 检索失败: %s", e)
+            return _PathHits(ok=False)
+
+    def _fetch_es(self, query: str, fetch_k: int) -> _PathHits:
+        if not self._es_ok():
+            return _PathHits(ok=False)
+        try:
+            hits = self.inf.search_rag_chunks(query, fetch_k) or []
+            return _PathHits(hits=hits, ok=True)
+        except Exception as e:
+            logger.warning("⚠️  ES 检索失败: %s", e)
+            return _PathHits(ok=False)
+
+    def _fetch_kg(self, query: str, fetch_k: int) -> _PathHits:
+        if not self._kg_ok():
+            return _PathHits(ok=False)
+        try:
+            hits = self._kg.search(query, fetch_k) or []
+            return _PathHits(hits=hits, ok=True)
+        except Exception as e:
+            logger.warning("⚠️  KG 检索失败: %s", e)
+            return _PathHits(ok=False)
+
+    # ─── 权重归一 ─────────────────────────────────────────────────────────
+
+    def _normalized_weights(self, kg_available: bool) -> tuple:
+        """计算三路权重（semantic, keyword, kg），KG 不可用时把权重归一到剩余两路。
+
+        约定：
+            sem_w = cfg.semantic_weight
+            kw_w  = 1 - sem_w - kg_w
+            kg_w  = cfg.kg_weight  （cfg.kg_enabled=False 或 KG 不可用时强制 0）
+        """
+        sem_w = max(0.0, float(self.cfg.semantic_weight))
+        kg_w = max(0.0, float(self.cfg.kg_weight))
+        if not getattr(self.cfg, "kg_enabled", False) or not kg_available:
+            kg_w = 0.0
+
+        # clamp，避免配置错误导致权重溢出
+        if sem_w > 1.0:
+            sem_w = 1.0
+        if sem_w + kg_w > 1.0:
+            kg_w = max(0.0, 1.0 - sem_w)
+
+        kw_w = 1.0 - sem_w - kg_w
+        if kw_w < 0:
+            kw_w = 0.0
+
+        total = sem_w + kw_w + kg_w
+        if total <= 0:
+            # 极端兜底：全 0 配置 → 平分两路
+            return 0.5, 0.5, 0.0
+        # 归一（已确保 total≈1 时不变）
+        return sem_w / total, kw_w / total, kg_w / total
+
+    # ─── KG-only 兜底（Milvus + ES 都失败但 KG 成功时） ─────────────────
+
+    def _materialize_kg_only(self, kg_hits: List, top_k: int) -> List[HybridResult]:
+        if not kg_hits:
+            return []
+        ids: List[int] = []
+        for h in kg_hits:
+            pid = h.pg_id if hasattr(h, "pg_id") else h.get("pg_id", 0)
+            if pid:
+                ids.append(pid)
+        if not ids:
+            return []
+        ids = ids[:top_k]
+        rows = self.inf.load_rag_chunks_by_ids(ids)
+        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        results: List[HybridResult] = []
+        for h in kg_hits:
+            pid = h.pg_id if hasattr(h, "pg_id") else h.get("pg_id", 0)
+            content = content_map.get(pid)
+            if not pid or content is None:
+                continue
+            score = float(getattr(h, "score", 0.0))
+            results.append(HybridResult(pg_id=pid, content=content, score=score, source="hybrid"))
+            if len(results) >= top_k:
+                break
+        return results

@@ -1,4 +1,4 @@
-# config — 配置管理（与主分支 Go 版字段对齐的 Python 配置骨架）
+# config — 配置管理（与主分支 Go 版字段对齐的 Python 配置）
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -12,10 +12,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class APIConfig:
-    """整合 Python 版主干能力的运行配置。"""
+    """整合 Python 版主干能力的运行配置（字段名与 Go 版 APIConfig 对齐）。"""
 
     def __init__(self):
-        # API / 模型
+        # ---- LLM / Embedding ----
         self.llm_api_url = ""
         self.llm_api_key = ""
         self.llm_model = ""
@@ -24,21 +24,35 @@ class APIConfig:
         self.embedding_api_key = ""
         self.embedding_model = ""
 
-        # 基础设施
+        # ---- Milvus ----
         self.milvus_host = ""
         self.milvus_port = 19530
+
+        # ---- Postgres ----
         self.pg_host = ""
         self.pg_port = 5432
         self.pg_user = ""
         self.pg_password = ""
         self.pg_database = ""
+
+        # ---- Elasticsearch ----
         self.es_addresses: List[str] = []
         self.es_username = ""
         self.es_password = ""
+
+        # ---- Kafka ----
         self.kafka_brokers: List[str] = []
         self.kafka_topic = ""
 
-        # RAG
+        # ---- Neo4j（知识图谱）----
+        self.neo4j_uri = ""
+        self.neo4j_user = ""
+        self.neo4j_password = ""
+        self.kg_max_hops = 2
+        self.kg_weight = 0.3
+        self.kg_enabled = False
+
+        # ---- RAG ----
         self.chunk_size = 200
         self.chunk_overlap = 50
         self.top_k = 3
@@ -47,8 +61,8 @@ class APIConfig:
         self.enable_hybrid_search = False
         self.rag_milvus_dim = 1024
 
-        # Memory
-        self.short_term_max_turns = 10
+        # ---- Memory ----
+        self.short_term_max_turns = 5
         self.long_term_top_k = 3
         self.memory_consolidation_similarity = 0.80
         self.memory_consolidation_dedup = 0.95
@@ -57,20 +71,38 @@ class APIConfig:
         self.memory_consolidation_min_import = 0.3
         self.memory_consolidation_trigger = 5
 
-        # Harness / runtime
+        # ---- Harness ----
         self.max_retries = 3
-        self.retry_delay_ms = 1000
-        self.step_timeout_ms = 30000
-        self.max_iterations = 10
+        self.retry_delay_ms = 200
+        self.step_timeout_ms = 5000
+        self.max_iterations = 5
 
-        # Search
+        # ---- Search ----
         self.search_api_key = ""
         self.search_api_url = ""
 
-        # Server
-        self.server_port = "8080"
+        # ---- Server ----
+        self.server_port = "8090"
         self.cors_origins: List[str] = []
 
+        # ---- Sandbox ----
+        self.sandbox_enabled = False
+        self.sandbox_backend = "docker"
+        self.sandbox_image = "ubuntu:22.04"
+        self.sandbox_timeout_ms = 30000
+        self.sandbox_max_output = 65536
+        self.sandbox_memory_mb = 256
+        self.sandbox_cpu_percent = 50
+        self.sandbox_max_pids = 64
+        self.sandbox_net_disabled = True
+        self.sandbox_readonly = True
+
+        # ---- Security ----
+        self.sec_max_cmd_length = 500
+        self.sec_allowlist_mode = False
+        self.sec_allowlist: List[str] = []
+
+    # ---- helpers ----
     def is_real_llm(self) -> bool:
         return bool(self.llm_api_key)
 
@@ -78,7 +110,10 @@ class APIConfig:
         return bool(self.embedding_api_key)
 
     def pg_dsn(self) -> str:
-        return f"postgres://{self.pg_user}:{self.pg_password}@{self.pg_host}:{self.pg_port}/{self.pg_database}?sslmode=disable"
+        return (
+            f"postgres://{self.pg_user}:{self.pg_password}"
+            f"@{self.pg_host}:{self.pg_port}/{self.pg_database}?sslmode=disable"
+        )
 
     def milvus_addr(self) -> str:
         return f"{self.milvus_host}:{self.milvus_port}"
@@ -95,7 +130,7 @@ def _read_yaml(path: str) -> Dict[str, Any]:
 
 def _resolve_config_path(explicit: Optional[str]) -> str:
     """按优先级找 config.yaml：参数 > 环境变量 > 项目根 > cwd。"""
-    candidates = []
+    candidates: List[str] = []
     if explicit:
         candidates.append(explicit)
     env = os.environ.get("AGI_CONFIG")
@@ -110,7 +145,7 @@ def _resolve_config_path(explicit: Optional[str]) -> str:
 
 
 def default_config(config_path: Optional[str] = None) -> APIConfig:
-    """从 config.yaml 加载配置（路径与 cwd 解耦）。"""
+    """从 config.yaml 加载配置（与 Go 版 DefaultConfig 字段一一对齐）。"""
     c = APIConfig()
     path = _resolve_config_path(config_path)
     data = _read_yaml(path)
@@ -138,13 +173,21 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.pg_database = pg.get("database", "")
 
     if es := data.get("elasticsearch"):
-        c.es_addresses = es.get("addresses", [])
+        c.es_addresses = es.get("addresses", []) or []
         c.es_username = es.get("username", "")
         c.es_password = es.get("password", "")
 
     if kafka := data.get("kafka"):
-        c.kafka_brokers = kafka.get("brokers", [])
+        c.kafka_brokers = kafka.get("brokers", []) or []
         c.kafka_topic = kafka.get("topic", "")
+
+    if neo4j := data.get("neo4j"):
+        c.neo4j_uri = neo4j.get("uri", "")
+        c.neo4j_user = neo4j.get("user", "")
+        c.neo4j_password = neo4j.get("password", "")
+        c.kg_max_hops = neo4j.get("max_hops", 2)
+        c.kg_weight = neo4j.get("weight", 0.3)
+        c.kg_enabled = bool(neo4j.get("enabled", False))
 
     if rag := data.get("rag"):
         c.chunk_size = rag.get("chunk_size", 200)
@@ -156,9 +199,9 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.rag_milvus_dim = rag.get("rag_milvus_dim", 1024)
 
     if memory := data.get("memory"):
-        c.short_term_max_turns = memory.get("short_term_max_turns", 10)
+        c.short_term_max_turns = memory.get("short_term_max_turns", 5)
         c.long_term_top_k = memory.get("long_term_top_k", 3)
-        cons = memory.get("consolidation", {})
+        cons = memory.get("consolidation", {}) or {}
         c.memory_consolidation_similarity = cons.get("similarity_threshold", 0.80)
         c.memory_consolidation_dedup = cons.get("dedup_threshold", 0.95)
         c.memory_consolidation_ttl_days = cons.get("ttl_days", 30)
@@ -168,24 +211,47 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
 
     if harness := data.get("harness"):
         c.max_retries = harness.get("max_retries", 3)
-        c.retry_delay_ms = harness.get("retry_delay_ms", 1000)
-        c.step_timeout_ms = harness.get("step_timeout_ms", 30000)
-        c.max_iterations = harness.get("max_iterations", 10)
+        c.retry_delay_ms = harness.get("retry_delay_ms", 200)
+        c.step_timeout_ms = harness.get("step_timeout_ms", 5000)
+        c.max_iterations = harness.get("max_iterations", 5)
 
     if search := data.get("search"):
         c.search_api_key = search.get("api_key", "")
         c.search_api_url = search.get("api_url", "")
 
     if server := data.get("server"):
-        c.server_port = server.get("port", "8080")
+        c.server_port = str(server.get("port", "8090"))
         c.cors_origins = server.get("cors_origins", []) or []
 
+    if sb := data.get("sandbox"):
+        c.sandbox_enabled = bool(sb.get("enabled", False))
+        c.sandbox_backend = sb.get("backend", "docker")
+        c.sandbox_image = sb.get("image", "ubuntu:22.04")
+        c.sandbox_timeout_ms = sb.get("timeout_ms", 30000)
+        c.sandbox_max_output = sb.get("max_output_bytes", 65536)
+        c.sandbox_memory_mb = sb.get("memory_limit_mb", 256)
+        c.sandbox_cpu_percent = sb.get("cpu_percent", 50)
+        c.sandbox_max_pids = sb.get("max_pids", 64)
+        c.sandbox_net_disabled = bool(sb.get("network_disabled", True))
+        c.sandbox_readonly = bool(sb.get("readonly_rootfs", True))
+
+    if sec := data.get("security"):
+        c.sec_max_cmd_length = sec.get("max_command_length", 500)
+        c.sec_allowlist_mode = bool(sec.get("allowlist_mode", False))
+        c.sec_allowlist = sec.get("allowlist", []) or []
+
+    _apply_defaults(c)
+    return c
+
+
+def _apply_defaults(c: APIConfig) -> None:
     if c.rrf_constant_k <= 0:
         c.rrf_constant_k = 60
     if c.semantic_weight <= 0:
         c.semantic_weight = 0.7
     if c.rag_milvus_dim <= 0:
         c.rag_milvus_dim = 1024
+
     if c.memory_consolidation_similarity <= 0:
         c.memory_consolidation_similarity = 0.80
     if c.memory_consolidation_dedup <= 0:
@@ -199,4 +265,25 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
     if c.memory_consolidation_trigger <= 0:
         c.memory_consolidation_trigger = 5
 
-    return c
+    if c.kg_max_hops <= 0:
+        c.kg_max_hops = 2
+    if c.kg_weight <= 0:
+        c.kg_weight = 0.3
+
+    if not c.sandbox_backend:
+        c.sandbox_backend = "docker"
+    if not c.sandbox_image:
+        c.sandbox_image = "ubuntu:22.04"
+    if c.sandbox_timeout_ms <= 0:
+        c.sandbox_timeout_ms = 30000
+    if c.sandbox_max_output <= 0:
+        c.sandbox_max_output = 65536
+    if c.sandbox_memory_mb <= 0:
+        c.sandbox_memory_mb = 256
+    if c.sandbox_cpu_percent <= 0:
+        c.sandbox_cpu_percent = 50
+    if c.sandbox_max_pids <= 0:
+        c.sandbox_max_pids = 64
+
+    if c.sec_max_cmd_length <= 0:
+        c.sec_max_cmd_length = 500

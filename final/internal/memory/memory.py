@@ -5,10 +5,13 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from config.config import APIConfig
 from internal.infra.infra import Infrastructure
+
+if TYPE_CHECKING:
+    from internal.memory.graph_memory import GraphMemory  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,8 @@ class Item:
     content: str
     importance: float = 0.5
     embedding: Optional[List[float]] = None
+    # 用于在 GraphMemory 中追踪节点；未设置时由 GraphMemory 用 content hash 派生
+    id: Optional[int] = None
 
 
 class ShortTerm:
@@ -74,14 +79,31 @@ class LongTerm:
         self._embed_fn: Optional[Any] = None
         self._last_consolidate_ts = 0.0
         self._items_since_last = 0
+        # 图增强记忆（可选；None 表示未启用 / Neo4j 不可用，所有 hook 均跳过）
+        self.graph_memory: Optional["GraphMemory"] = None
+        self._next_id: int = 0
 
     def set_embed_fn(self, fn):
         self._embed_fn = fn
 
+    def set_graph_memory(self, graph_memory: Optional["GraphMemory"]) -> None:
+        """注入图增强记忆层；可在任意时刻调用，None 表示解除注入。"""
+        self.graph_memory = graph_memory
+
     def load_from_storage(self):
         rows = self.inf.load_long_term_items()
         self.items = [Item(content=r.content, importance=r.importance, embedding=r.embedding) for r in rows]
+        # 重建 id 序列，确保后续 add 不与已有 item 冲突
+        for idx, item in enumerate(self.items):
+            item.id = idx
+        self._next_id = len(self.items)
         logger.info("✅ 从存储恢复了 %d 条长期记忆", len(self.items))
+        # 图增强记忆 hook：批量索引（启动期把 LTM 全量同步进图）
+        if self.graph_memory is not None:
+            try:
+                self.graph_memory.bulk_index(self.items)
+            except Exception as e:
+                logger.warning("⚠️  graph_memory.bulk_index 失败: %s", e)
 
     def add(self, content: str, importance: float = 0.5):
         embedding = None
@@ -91,11 +113,21 @@ class LongTerm:
             except Exception as e:
                 logger.warning("⚠️  向量化失败: %s", e)
 
-        item = Item(content=content, importance=importance, embedding=embedding)
+        item = Item(content=content, importance=importance, embedding=embedding, id=self._next_id)
+        self._next_id += 1
+        # 旧条目快照（add_to_graph 内会扫描这些建立 SIMILAR_TO 边）
+        prior = list(self.items)
         self.items.append(item)
         self._items_since_last += 1
         emb_json = json.dumps(embedding) if embedding else "null"
         self.inf.save_long_term_item(content, importance, emb_json)
+
+        # 图增强记忆 hook：新增条目同步进图
+        if self.graph_memory is not None:
+            try:
+                self.graph_memory.add_to_graph(item, neighbors=prior[-50:])
+            except Exception as e:
+                logger.warning("⚠️  graph_memory.add_to_graph 失败: %s", e)
 
     def recall(self, query: str, top_k: int = 3) -> List[Item]:
         if not self.items:
@@ -158,6 +190,8 @@ class LongTerm:
                 if sim >= self.cfg.memory_consolidation_dedup:
                     drop = i if self.items[i].importance < self.items[j].importance else j
                     to_remove.add(drop)
+        # 收集被去重淘汰的 id（用于图同步删除）
+        removed_ids: List[int] = [self.items[i].id for i in to_remove if self.items[i].id is not None]
         self.items = [item for i, item in enumerate(self.items) if i not in to_remove]
 
         # 2) 按时间间隔衰减（避免每轮对话都被衰减一次）
@@ -166,8 +200,25 @@ class LongTerm:
             item.importance *= decay
 
         # 3) TTL 淘汰
-        self.items = [item for item in self.items if item.importance >= self.cfg.memory_consolidation_min_import]
+        ttl_min = self.cfg.memory_consolidation_min_import
+        kept: List[Item] = []
+        for item in self.items:
+            if item.importance >= ttl_min:
+                kept.append(item)
+            elif item.id is not None:
+                removed_ids.append(item.id)
+        self.items = kept
         logger.info("✅ 记忆合并完成，剩余 %d 条", len(self.items))
+
+        # 图增强记忆 hook：被淘汰的条目同步从图中删除；保留的条目更新 importance
+        if self.graph_memory is not None:
+            try:
+                for rid in removed_ids:
+                    self.graph_memory.delete_from_graph(rid)
+                for item in self.items:
+                    self.graph_memory.update_node(item)
+            except Exception as e:
+                logger.warning("⚠️  graph_memory consolidate hook 失败: %s", e)
 
     def _compute_similarity(self, a: str, b: str) -> float:
         """中英文 Jaccard 相似度。"""
@@ -210,3 +261,72 @@ class Preference:
 
     def get_all(self) -> Dict[str, str]:
         return self.preferences.copy()
+
+
+class MemoryManager:
+    """三层记忆 + 可选 GraphMemory 的统一容器。
+
+    现有 ShortTerm/LongTerm/Preference 行为完全保留；GraphMemory 作为可选注入点：
+      - 存入新长期记忆 → 自动调用 graph_memory.add_to_graph(item)
+      - 删除/更新长期记忆（consolidate）→ 自动调用 delete_from_graph / update_node
+
+    所有 hook 实际位于 LongTerm 内部；MemoryManager 负责装配并把 graph_memory
+    注入到 LongTerm 上。Neo4j 不可用或未注入时，所有 hook 都是 no-op。
+    """
+
+    def __init__(
+        self,
+        cfg: APIConfig,
+        inf: Infrastructure,
+        user_id: str = "default_user",
+        graph_memory: Optional["GraphMemory"] = None,
+    ):
+        self.cfg = cfg
+        self.inf = inf
+        self.short_term = ShortTerm(cfg.short_term_max_turns)
+        self.long_term = LongTerm(cfg, inf)
+        self.preference = Preference(user_id, inf)
+        # 可选注入点：可以构造时传入，也可以后续 set_graph_memory() 注入
+        self.graph_memory: Optional["GraphMemory"] = graph_memory
+        if graph_memory is not None:
+            self.long_term.set_graph_memory(graph_memory)
+
+    def set_graph_memory(self, graph_memory: Optional["GraphMemory"]) -> None:
+        """挂载 / 解除 GraphMemory；同步透传到 LongTerm。"""
+        self.graph_memory = graph_memory
+        self.long_term.set_graph_memory(graph_memory)
+
+    # ── 长期记忆操作的薄包装（保持调用方一致；hook 已位于 LongTerm 内部）──
+
+    def add_long_term(self, content: str, importance: float = 0.5) -> None:
+        """存入新长期记忆；命中 LongTerm.add hook 自动同步图。"""
+        self.long_term.add(content, importance)
+
+    def consolidate(self) -> None:
+        """触发长期记忆 consolidate；命中 LongTerm.consolidate hook 自动同步图。"""
+        self.long_term.consolidate()
+
+    def recall(self, query: str, top_k: int = 3) -> List[Item]:
+        """语义召回；如果挂载了 graph_memory，则在向量召回基础上做一跳图扩展。"""
+        seed = self.long_term.recall(query, top_k)
+        if not self.graph_memory or not seed:
+            return seed
+        seed_ids = [it.id for it in seed if it.id is not None]
+        if not seed_ids:
+            return seed
+        try:
+            expanded_ids = set()
+            for sid in seed_ids:
+                expanded_ids.update(self.graph_memory.find_related(sid))
+        except Exception as e:
+            logger.warning("⚠️  graph_memory.find_related 失败: %s", e)
+            return seed
+        seed_id_set = set(seed_ids)
+        extras: List[Item] = []
+        for it in self.long_term.items:
+            if it.id in expanded_ids and it.id not in seed_id_set:
+                extras.append(it)
+        return seed + extras
+
+    def need_consolidation(self) -> bool:
+        return self.long_term.need_consolidation()

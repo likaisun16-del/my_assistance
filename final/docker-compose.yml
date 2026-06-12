@@ -108,6 +108,26 @@ services:
     volumes:
       - kafka_data:/bitnami/kafka
 
+  # ── Neo4j 知识图谱 ──
+  neo4j:
+    image: neo4j:5.18-community
+    container_name: agi-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/password123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p password123 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
   # ── 应用容器 ──
   app:
     build:
@@ -123,11 +143,13 @@ services:
         condition: service_started
       kafka:
         condition: service_started
+      neo4j:
+        condition: service_started
     environment:
       AGI_CONFIG: /app/config/config.yaml
       FRONTEND_DIR: /app/frontend
     ports:
-      - "8080:8080"
+      - "8090:8090"
     volumes:
       - ./config/config.yaml:/app/config/config.yaml:ro
 
@@ -138,3 +160,5 @@ volumes:
   minio_data:
   milvus_data:
   kafka_data:
+  neo4j_data:
+  neo4j_logs:

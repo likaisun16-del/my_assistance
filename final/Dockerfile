@@ -29,9 +29,9 @@ COPY frontend/ ./frontend/
 ENV FRONTEND_DIR=/app/frontend \
     AGI_CONFIG=/app/config/config.yaml
 
-EXPOSE 8080
+EXPOSE 8090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8080/health || exit 1
+    CMD curl -fsS http://localhost:8090/health || exit 1
 
 ENTRYPOINT ["python", "-u", "main.py"]
