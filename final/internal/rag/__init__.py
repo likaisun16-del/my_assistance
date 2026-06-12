@@ -1,2 +1,2 @@
-from .rag import Chunk, Engine, SearchResult
+from .rag import Chunk, Engine
 from .hybrid import HybridStore, HybridResult
