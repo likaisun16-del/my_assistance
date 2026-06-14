@@ -122,9 +122,11 @@ class Infrastructure:
                 doc_hash    TEXT NOT NULL,
                 chunk_idx   INT NOT NULL,
                 content     TEXT NOT NULL,
+                parent_content TEXT,
                 embedding   JSONB,
                 created_at  TIMESTAMP DEFAULT NOW()
             )""",
+            """ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS parent_content TEXT""",
         ]
         with self._pg.cursor() as cur:
             for ddl in ddls:
@@ -235,13 +237,25 @@ class Infrastructure:
             return []
 
     def save_rag_chunk(self, doc_hash: str, chunk_idx: int, content: str, embedding_json: str) -> int:
+        return self.save_rag_chunk_with_parent(doc_hash, chunk_idx, content, "", embedding_json)
+
+    def save_rag_chunk_with_parent(
+        self,
+        doc_hash: str,
+        chunk_idx: int,
+        content: str,
+        parent_content: str,
+        embedding_json: str,
+    ) -> int:
         if not self._pg:
             return -1
         try:
             with self._pg.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO rag_chunks (doc_hash, chunk_idx, content, embedding) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (doc_hash, chunk_idx, content, embedding_json),
+                    """INSERT INTO rag_chunks (doc_hash, chunk_idx, content, parent_content, embedding)
+                       VALUES (%s, %s, %s, NULLIF(%s, ''), %s)
+                       RETURNING id""",
+                    (doc_hash, chunk_idx, content, parent_content, embedding_json),
                 )
                 row = cur.fetchone()
                 return row[0] if row else -1
@@ -268,10 +282,13 @@ class Infrastructure:
         try:
             with self._pg.cursor() as cur:
                 placeholders = ",".join(["%s"] * len(ids))
-                cur.execute(f"SELECT id, content FROM rag_chunks WHERE id IN ({placeholders})", tuple(ids))
+                cur.execute(
+                    f"SELECT id, content, COALESCE(parent_content, '') FROM rag_chunks WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
                 rows = []
-                for rid, content in cur.fetchall():
-                    rows.append({"id": rid, "content": content})
+                for rid, content, parent_content in cur.fetchall():
+                    rows.append({"id": rid, "content": content, "parent_content": parent_content})
                 return rows
         except Exception as e:
             logger.warning("⚠️  加载 RAG chunks 失败: %s", e)

@@ -34,3 +34,6 @@ __all__ = [
     "Extractor",
     "KGStore",
 ]
+from .task_graph import Node, NodeStatus, NodeType, TaskGraph
+
+__all__ = ["Node", "NodeStatus", "NodeType", "TaskGraph"]

@@ -43,6 +43,12 @@ rag:
   semantic_weight: 0.7
   enable_hybrid_search: true
   rag_milvus_dim: 2048
+  rewrite:
+    enabled: true
+    num_queries: 3
+  rerank:
+    enabled: true
+    preview_len: 200
 
 memory:
   short_term_max_turns: 5
@@ -60,6 +66,11 @@ harness:
   retry_delay_ms: 200
   step_timeout_ms: 5000
   max_iterations: 5
+
+graph_runtime:
+  max_parallel: 2
+  race_timeout_ms: 30000
+  enable_racing: true
 
 server:
   port: "8090"

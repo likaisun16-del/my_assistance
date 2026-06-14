@@ -6,6 +6,7 @@
 # 任一路不可用 / 失败时跳过并把剩余权重重新归一，避免某一路因不可用拉低融合分数。
 import logging
 from dataclasses import dataclass, field
+import threading
 from typing import Callable, Dict, List, Optional
 
 from config.config import APIConfig
@@ -26,6 +27,7 @@ class HybridResult:
     content: str = ""
     score: float = 0.0
     source: str = ""  # "hybrid" | "semantic" | "keyword"
+    parent: str = ""
 
 
 @dataclass
@@ -57,6 +59,7 @@ class HybridStore:
         self.inf = inf
         self._embed_fn = embed_fn
         self._kg = kg
+        self._reranker = None
         self.mode = self._resolve_mode()
 
     # ─── 注入式 setter（与 Go 版接口对齐） ─────────────────────────────────
@@ -66,6 +69,9 @@ class HybridStore:
 
     def set_kg_store(self, kg: Optional[KGStore]) -> None:
         self._kg = kg
+
+    def set_reranker(self, reranker) -> None:
+        self._reranker = reranker
 
     # ─── 基础设施可用性 ──────────────────────────────────────────────────
 
@@ -101,6 +107,61 @@ class HybridStore:
             return self._search_keyword(query, top_k)
         logger.warning("⚠️  检索基础设施不可用（Milvus 和 ES 均未连接）")
         return []
+
+    def search_multi(self, queries: List[str], top_k: int) -> List[HybridResult]:
+        queries = [q for q in (queries or []) if q]
+        if not queries:
+            return []
+        pool = self._rerank_pool(top_k)
+        if len(queries) == 1:
+            return self._finalize(queries[0], self.search(queries[0], pool), top_k)
+
+        results_by_query: List[List[HybridResult]] = [[] for _ in queries]
+        threads = []
+
+        def _run(idx: int, q: str) -> None:
+            results_by_query[idx] = self.search(q, pool)
+
+        for i, q in enumerate(queries):
+            t = threading.Thread(target=_run, args=(i, q), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+
+        k = self.cfg.rrf_constant_k if self.cfg.rrf_constant_k > 0 else 60
+        merged: Dict[str, dict] = {}
+        for query_results in results_by_query:
+            for rank, result in enumerate(query_results):
+                key = f"id:{result.pg_id}" if result.pg_id else f"c:{result.content[:100]}"
+                score = 1.0 / float(k + rank + 1)
+                if key in merged:
+                    merged[key]["score"] += score
+                    if result.score > merged[key]["result"].score:
+                        merged[key]["result"] = result
+                else:
+                    merged[key] = {"score": score, "result": result}
+
+        out: List[HybridResult] = []
+        for item in merged.values():
+            result = item["result"]
+            result.score = item["score"]
+            out.append(result)
+        out.sort(key=lambda r: r.score, reverse=True)
+        if len(out) > pool:
+            out = out[:pool]
+        return self._finalize(queries[0], out, top_k)
+
+    def _rerank_pool(self, top_k: int) -> int:
+        pool = top_k * (4 if self._reranker is not None else 2)
+        return max(pool, 10)
+
+    def _finalize(self, query: str, results: List[HybridResult], top_k: int) -> List[HybridResult]:
+        if self._reranker is not None and len(results) > 1:
+            return self._reranker.rerank(query, results, top_k)
+        if top_k > 0 and len(results) > top_k:
+            return results[:top_k]
+        return results
 
     # ─── 混合检索：三路 RRF 融合 ─────────────────────────────────────────
 
@@ -164,14 +225,20 @@ class HybridStore:
         # 从 PG 批量取回 chunk 内容
         ids = [pid for pid, _ in sorted_ids]
         rows = self.inf.load_rag_chunks_by_ids(ids)
-        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        row_map: Dict[int, dict] = {r["id"]: r for r in rows}
 
         results: List[HybridResult] = []
         for pid, score in sorted_ids:
-            content = content_map.get(pid)
-            if content is None:
+            row = row_map.get(pid)
+            if row is None:
                 continue
-            results.append(HybridResult(pg_id=pid, content=content, score=score, source="hybrid"))
+            results.append(HybridResult(
+                pg_id=pid,
+                content=row.get("content", ""),
+                score=score,
+                source="hybrid",
+                parent=row.get("parent_content", "") or row.get("parent", ""),
+            ))
         return results
 
     # ─── 单路：Milvus 语义 ───────────────────────────────────────────────
@@ -182,18 +249,20 @@ class HybridStore:
             return []
         ids = [h["pg_id"] for h in path.hits if h.get("pg_id") is not None]
         rows = self.inf.load_rag_chunks_by_ids(ids) if ids else []
-        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        row_map: Dict[int, dict] = {r["id"]: r for r in rows}
         results: List[HybridResult] = []
         for h in path.hits:
             pid = h.get("pg_id")
             if pid is None:
                 continue
-            content = content_map.get(pid) or h.get("content") or ""
+            row = row_map.get(pid, {})
+            content = row.get("content") or h.get("content") or ""
             if not content:
                 continue
             results.append(HybridResult(
                 pg_id=pid, content=content,
                 score=float(h.get("score", 0.0)), source="semantic",
+                parent=row.get("parent_content", "") or row.get("parent", ""),
             ))
         return results
 
@@ -205,18 +274,20 @@ class HybridStore:
             return []
         ids = [h["pg_id"] for h in path.hits if h.get("pg_id") is not None]
         rows = self.inf.load_rag_chunks_by_ids(ids) if ids else []
-        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        row_map: Dict[int, dict] = {r["id"]: r for r in rows}
         results: List[HybridResult] = []
         for h in path.hits:
             pid = h.get("pg_id")
             if pid is None:
                 continue
-            content = content_map.get(pid) or h.get("content") or ""
+            row = row_map.get(pid, {})
+            content = row.get("content") or h.get("content") or ""
             if not content:
                 continue
             results.append(HybridResult(
                 pg_id=pid, content=content,
                 score=float(h.get("score", 0.0)), source="keyword",
+                parent=row.get("parent_content", "") or row.get("parent", ""),
             ))
         return results
 
@@ -315,15 +386,19 @@ class HybridStore:
             return []
         ids = ids[:top_k]
         rows = self.inf.load_rag_chunks_by_ids(ids)
-        content_map: Dict[int, str] = {r["id"]: r["content"] for r in rows}
+        row_map: Dict[int, dict] = {r["id"]: r for r in rows}
         results: List[HybridResult] = []
         for h in kg_hits:
             pid = h.pg_id if hasattr(h, "pg_id") else h.get("pg_id", 0)
-            content = content_map.get(pid)
+            row = row_map.get(pid, {})
+            content = row.get("content")
             if not pid or content is None:
                 continue
             score = float(getattr(h, "score", 0.0))
-            results.append(HybridResult(pg_id=pid, content=content, score=score, source="hybrid"))
+            results.append(HybridResult(
+                pg_id=pid, content=content, score=score, source="hybrid",
+                parent=row.get("parent_content", "") or row.get("parent", ""),
+            ))
             if len(results) >= top_k:
                 break
         return results

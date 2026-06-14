@@ -24,10 +24,31 @@ from config.config import APIConfig
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient, Message
 from internal.memory.memory import LongTerm, Preference, ShortTerm
+from internal.promptctx import (
+    ConstraintsSource,
+    ContextAssembler,
+    PlannerSnapshot,
+    PlannerSource,
+    Policy,
+    ProfileSource,
+    Query,
+    RecallSource,
+    SourceRegistry,
+    StepObservation,
+    TaskMemBuffer,
+    TaskMemSource,
+    ToolCallTrace,
+    ToolStateSource,
+    ToolStateTracker,
+    default_schemas,
+)
 from internal.rag.rag import Engine as RAGEngine
+from internal.rag.reranker import LLMReranker
+from internal.rag.rewriter import HistoryMessage, LLMRewriter
 from internal.tools.tools import Tool, ToolExecutor, default_tools, new_mcp_tool
 
 from .cancel import CancelRegistry, go_safe
+from .graph_runtime import GraphConfig, GraphRuntime
 from .init_sandbox import init_sandbox
 from .memory_writer import (
     AsyncMemoryWriter,
@@ -37,6 +58,7 @@ from .memory_writer import (
 )
 from .restore import init_knowledge_graph, restore_from_db, restore_rag_from_db
 from .router import detect_tool, need_rag, need_react, need_react_from_tools, need_tool
+from .planner import llm_plan_graph
 from .status import infra_status, status as build_status
 
 logger = logging.getLogger(__name__)
@@ -119,6 +141,10 @@ class UnifiedAgent:
         if self.rag is not None:
             try:
                 self.rag.set_generate_fn(self._llm_generate)
+                if getattr(cfg, "rag_rewrite_enabled", False):
+                    self.rag.set_rewriter(LLMRewriter(self._llm_generate, cfg.rag_rewrite_num_queries))
+                if getattr(cfg, "rag_rerank_enabled", False):
+                    self.rag.set_reranker(LLMReranker(self._llm_generate, cfg.rag_rerank_preview_len))
             except Exception as e:
                 logger.warning("⚠️  RAG generate 函数注入失败: %s", e)
 
@@ -154,6 +180,7 @@ class UnifiedAgent:
         # 快照计数器（每 N 轮序列化 agent_state 到 PG）
         self._turn_count = 0
         self._snapshot_every = max(1, getattr(cfg, "snapshot_every_turns", 5) or 5)
+        self._build_prompt_context()
 
         logger.info("✅ UnifiedAgent 初始化完成")
 
@@ -237,7 +264,7 @@ class UnifiedAgent:
                     )
             elif opts.use_rag and rag_loaded:
                 resp.mode = "rag"
-                resp.answer, resp.search_results = self.rag.query(query)
+                resp.answer, resp.search_results = self._run_rag_query(query)
             else:
                 resp.mode = "chat"
                 resp.answer = self._chat_response(mem_prefix, hist_msgs)
@@ -254,7 +281,7 @@ class UnifiedAgent:
                 )
             elif need_rag(query, rag_loaded):
                 resp.mode = "rag"
-                resp.answer, resp.search_results = self.rag.query(query)
+                resp.answer, resp.search_results = self._run_rag_query(query)
             else:
                 resp.mode = "chat"
                 resp.answer = self._chat_response(mem_prefix, hist_msgs)
@@ -294,6 +321,60 @@ class UnifiedAgent:
     def _llm_generate(self, system_prompt: str, user_msg: str) -> str:
         return self.llm.chat([Message(role="user", content=user_msg)], system_prompt=system_prompt)
 
+    def _build_prompt_context(self) -> None:
+        self.task_mem = TaskMemBuffer(20)
+        self.tool_tracker = ToolStateTracker(10)
+        registry = SourceRegistry()
+        registry.register(ProfileSource(self.preference, self.ltm))
+        registry.register(PlannerSource(self._planner_snapshot))
+        registry.register(TaskMemSource(self.task_mem))
+        registry.register(ToolStateSource(lambda: self.tool_executor._tool_map, self.tool_tracker))
+        registry.register(ConstraintsSource([
+            Policy(pattern="rm -rf", reason="禁止破坏性删除命令", level="block"),
+            Policy(pattern="sudo", reason="禁止提权命令", level="block"),
+        ]))
+        registry.register(RecallSource(self.ltm))
+        self.prompt_assembler = ContextAssembler(default_schemas(), registry)
+
+    def _planner_snapshot(self):
+        task = self._cancel_registry.current_task() if hasattr(self, "_cancel_registry") else None
+        if not task:
+            return None
+        steps = task.get("steps") or []
+        return PlannerSnapshot(
+            task_id=task.get("task_id", ""),
+            query=task.get("query", ""),
+            status=task.get("status", ""),
+            phase=task.get("phase", ""),
+            total_steps=len(steps),
+            current_step=task.get("current_step", 0),
+            interrupted_at=task.get("interrupted_at", ""),
+        )
+
+    def _build_context_prefix(self, query: str, mode: str = "chat") -> str:
+        if not hasattr(self, "prompt_assembler"):
+            self._build_prompt_context()
+        try:
+            return self.prompt_assembler.assemble(Query(text=query, mode=mode)).render()
+        except Exception as e:
+            logger.warning("⚠️  promptctx 装配失败，降级到旧记忆前缀: %s", e)
+            return self._build_memory_system_prefix(query)
+
+    def push_task_mem(self, obs: StepObservation) -> None:
+        if hasattr(self, "task_mem"):
+            self.task_mem.push(obs)
+
+    def record_tool_call(self, trace: ToolCallTrace) -> None:
+        if hasattr(self, "tool_tracker"):
+            self.tool_tracker.record(trace)
+
+    def save_snapshot(self, task: dict) -> None:
+        task_id = task.get("task_id", f"task_{int(time.time())}") if isinstance(task, dict) else f"task_{int(time.time())}"
+        try:
+            self.inf.save_snapshot(task_id, json.dumps(task, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("⚠️  快照写入失败: %s", e)
+
     def _save_chat_history(self, role: str, content: str) -> None:
         """best-effort 写聊天记录。优先 chat_repo，其次 inf.save_chat_history。"""
         chat_repo = getattr(self, "chat_repo", None)
@@ -319,6 +400,16 @@ class UnifiedAgent:
         if memories:
             parts.append("相关记忆:\n" + "\n".join(f"- {m.content}" for m in memories))
         return "\n".join(parts)
+
+    def _recent_history_for_rag(self) -> List[HistoryMessage]:
+        return [HistoryMessage(role=m["role"], content=m["content"]) for m in self.stm.get()]
+
+    def _run_rag_query(self, query: str):
+        if self.rag is None:
+            return "RAG 不可用", []
+        if hasattr(self.rag, "query_with_history"):
+            return self.rag.query_with_history(query, self._recent_history_for_rag())
+        return self.rag.query(query)
 
     def _build_history_messages(self, query: str) -> List[Message]:
         msgs = [Message(role=m["role"], content=m["content"]) for m in self.stm.get()]
@@ -370,9 +461,53 @@ class UnifiedAgent:
     # ── ReAct 推理循环（保留原 agent.py 的实现） ───────────────────────────
 
     def _run_react_with_tools(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token):
-        steps: List[ReActStep] = []
         task = {"task_id": f"task_{int(time.time())}", "query": query, "status": "running", "steps": []}
         self._cancel_registry.set_task(task)
+        plan_nodes = llm_plan_graph(self, query, tools_map, mem_prefix)
+        if plan_nodes:
+            from internal.graph.task_graph import TaskGraph
+
+            graph = TaskGraph(plan_nodes)
+            try:
+                graph.validate()
+            except Exception:
+                for node in plan_nodes:
+                    node.depends_on = []
+                graph = TaskGraph(plan_nodes)
+            cfg = GraphConfig(
+                max_parallel=getattr(self.cfg, "graph_max_parallel", 2),
+                race_timeout_ms=getattr(self.cfg, "graph_race_timeout_ms", 30000),
+                enable_racing=getattr(self.cfg, "graph_enable_racing", True),
+            )
+            result = GraphRuntime(graph, self, cfg, tools_map, task).execute(token)
+            steps = [
+                ReActStep(
+                    type=StepType.OBSERVATION,
+                    content=node.result or node.error,
+                    tool=node.tool_name,
+                    params=node.params,
+                )
+                for node in graph.nodes.values()
+            ]
+            final_answer = self._generate_final_answer(query, steps, mem_prefix)
+            steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
+            task["status"] = "interrupted" if result.interrupted else "completed"
+            task["graph"] = {
+                "nodes": [
+                    {
+                        "id": node.id,
+                        "tool": node.tool_name,
+                        "status": str(node.status),
+                        "result": node.result,
+                        "error": node.error,
+                    }
+                    for node in graph.nodes.values()
+                ]
+            }
+            self._cancel_registry.set_task(None)
+            return self._format_react_response(steps), steps, task
+
+        steps: List[ReActStep] = []
 
         for _ in range(self.max_iterations):
             if token.is_cancelled():

@@ -154,6 +154,12 @@ class LongTerm:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [item for item, score in scored[:top_k] if score >= 0.4]
 
+    def filter_by_category(self, categories: List[str], limit: int) -> List[Item]:
+        """PromptContext 适配：当前 Item 尚无 category 字段，按重要性返回前 N 条。"""
+        if limit <= 0:
+            limit = 10
+        return sorted(self.items, key=lambda item: item.importance, reverse=True)[:limit]
+
     def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
         if len(a) != len(b):
             return 0.0
@@ -261,6 +267,9 @@ class Preference:
 
     def get_all(self) -> Dict[str, str]:
         return self.preferences.copy()
+
+    def snapshot(self) -> Dict[str, str]:
+        return self.get_all()
 
 
 class MemoryManager:

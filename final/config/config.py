@@ -60,6 +60,10 @@ class APIConfig:
         self.semantic_weight = 0.7
         self.enable_hybrid_search = False
         self.rag_milvus_dim = 1024
+        self.rag_rewrite_enabled = False
+        self.rag_rewrite_num_queries = 3
+        self.rag_rerank_enabled = False
+        self.rag_rerank_preview_len = 200
 
         # ---- Memory ----
         self.short_term_max_turns = 5
@@ -76,6 +80,11 @@ class APIConfig:
         self.retry_delay_ms = 200
         self.step_timeout_ms = 5000
         self.max_iterations = 5
+
+        # ---- Graph Runtime ----
+        self.graph_max_parallel = 2
+        self.graph_race_timeout_ms = 30000
+        self.graph_enable_racing = True
 
         # ---- Search ----
         self.search_api_key = ""
@@ -197,6 +206,12 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.semantic_weight = rag.get("semantic_weight", 0.7)
         c.enable_hybrid_search = rag.get("enable_hybrid_search", False)
         c.rag_milvus_dim = rag.get("rag_milvus_dim", 1024)
+        rewrite = rag.get("rewrite", {}) or {}
+        c.rag_rewrite_enabled = bool(rewrite.get("enabled", False))
+        c.rag_rewrite_num_queries = rewrite.get("num_queries", 3)
+        rerank = rag.get("rerank", {}) or {}
+        c.rag_rerank_enabled = bool(rerank.get("enabled", False))
+        c.rag_rerank_preview_len = rerank.get("preview_len", 200)
 
     if memory := data.get("memory"):
         c.short_term_max_turns = memory.get("short_term_max_turns", 5)
@@ -214,6 +229,11 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.retry_delay_ms = harness.get("retry_delay_ms", 200)
         c.step_timeout_ms = harness.get("step_timeout_ms", 5000)
         c.max_iterations = harness.get("max_iterations", 5)
+
+    if graph_runtime := data.get("graph_runtime"):
+        c.graph_max_parallel = graph_runtime.get("max_parallel", 2)
+        c.graph_race_timeout_ms = graph_runtime.get("race_timeout_ms", 30000)
+        c.graph_enable_racing = bool(graph_runtime.get("enable_racing", True))
 
     if search := data.get("search"):
         c.search_api_key = search.get("api_key", "")
@@ -251,6 +271,10 @@ def _apply_defaults(c: APIConfig) -> None:
         c.semantic_weight = 0.7
     if c.rag_milvus_dim <= 0:
         c.rag_milvus_dim = 1024
+    if c.rag_rewrite_num_queries <= 0:
+        c.rag_rewrite_num_queries = 3
+    if c.rag_rerank_preview_len <= 0:
+        c.rag_rerank_preview_len = 200
 
     if c.memory_consolidation_similarity <= 0:
         c.memory_consolidation_similarity = 0.80
@@ -269,6 +293,11 @@ def _apply_defaults(c: APIConfig) -> None:
         c.kg_max_hops = 2
     if c.kg_weight <= 0:
         c.kg_weight = 0.3
+
+    if c.graph_max_parallel <= 0:
+        c.graph_max_parallel = 2
+    if c.graph_race_timeout_ms <= 0:
+        c.graph_race_timeout_ms = 30000
 
     if not c.sandbox_backend:
         c.sandbox_backend = "docker"

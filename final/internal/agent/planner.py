@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from internal.graph.task_graph import Node, NodeType
 from internal.llm.llm import Message
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,70 @@ def llm_plan_steps(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
     return valid
 
 
+def llm_plan_graph(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str) -> List[Node]:
+    """调用 Planner LLM 产出图节点，支持 depends_on 和 race_group。"""
+    if not agent.cfg.is_real_llm():
+        return rule_plan_nodes(agent, query, tools_map)
+
+    tool_lines: List[str] = []
+    for name, t in tools_map.items():
+        p_descs: List[str] = []
+        for p in getattr(t, "params", []) or []:
+            req = "（必填）" if p.get("required") else ""
+            p_descs.append(f"{p.get('name','')}({p.get('type','string')}){req}")
+        params = ", ".join(p_descs) if p_descs else "无"
+        tool_lines.append(f"- {name}: {getattr(t, 'description', '')} [参数: {params}]")
+
+    plan_prompt = (
+        "你是一个任务规划器。根据用户问题，从可用工具中选出需要调用的工具，并标注依赖关系。\n"
+        "- 给每个工具调用分配唯一 id，如 n1、n2。\n"
+        "- 如果工具 B 需要工具 A 的输出，则 B 的 depends_on 包含 A 的 id。\n"
+        "- 如果两个工具功能类似，可设置相同 race_group，系统会并行竞速。\n"
+        f"用户问题：{query}\n"
+        f"可用工具：\n{chr(10).join(tool_lines)}\n"
+        '请只输出 JSON 数组：[{"id":"n1","tool":"工具名","params":{},'
+        '"reason":"原因","depends_on":[],"race_group":""}]。无需工具则输出 []。'
+    )
+    planner_base = "你是一个精准的任务规划器，只在必要时才调用工具。"
+    if mem_prefix:
+        planner_base = mem_prefix + "\n\n" + planner_base
+    try:
+        raw = agent.llm.chat([Message(role="user", content=plan_prompt)], system_prompt=planner_base)
+        data = json.loads(_clean_json(raw))
+    except Exception as e:
+        logger.warning("⚠️  Planner LLM 图解析失败 (%s)，降级到规则规划。", e)
+        return rule_plan_nodes(agent, query, tools_map)
+
+    nodes: List[Node] = []
+    if not isinstance(data, list):
+        return nodes
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        tool = str(item.get("tool") or item.get("name") or "")
+        if tool not in tools_map:
+            continue
+        params = item.get("params")
+        if params is None:
+            params = item.get("parameters")
+        if not isinstance(params, dict):
+            params = {}
+        node_id = str(item.get("id") or f"n{idx + 1}")
+        depends = item.get("depends_on") or []
+        if not isinstance(depends, list):
+            depends = []
+        nodes.append(Node(
+            id=node_id,
+            type=NodeType.TOOL,
+            name=str(item.get("reason") or "LLM 规划调用"),
+            tool_name=tool,
+            params={k: str(v) for k, v in params.items()},
+            depends_on=[str(dep) for dep in depends],
+            race_group=str(item.get("race_group") or ""),
+        ))
+    return nodes
+
+
 def rule_plan_items(agent, query: str, tools_map: Dict[str, Any]) -> List[PlanItem]:
     """关键字规则降级规划（无真实 LLM 时使用）。"""
     q = query.lower()
@@ -156,3 +221,33 @@ def rule_plan_items(agent, query: str, tools_map: Dict[str, Any]) -> List[PlanIt
         items.append(PlanItem(tool=name, params=params, reason=f"调用工具 {name}"))
 
     return items
+
+
+def rule_plan_nodes(agent, query: str, tools_map: Dict[str, Any]) -> List[Node]:
+    """关键字规则降级规划，返回图节点。"""
+    items = rule_plan_items(agent, query, tools_map)
+    nodes: List[Node] = []
+    for idx, item in enumerate(items):
+        race_group = "search" if item.tool in {"search_web", "rag_search"} else ""
+        nodes.append(Node(
+            id=f"n{idx + 1}",
+            type=NodeType.TOOL,
+            name=item.reason,
+            tool_name=item.tool,
+            params=item.params,
+            depends_on=[],
+            race_group=race_group,
+        ))
+    return nodes
+
+
+def _clean_json(raw: str) -> str:
+    raw = (raw or "").strip()
+    if "<|FunctionCallBegin|>" in raw:
+        raw = raw[raw.index("<|FunctionCallBegin|>") + len("<|FunctionCallBegin|>"):]
+        if "<|FunctionCallEnd|>" in raw:
+            raw = raw[: raw.index("<|FunctionCallEnd|>")]
+    raw = re.sub(r"^```json", "", raw)
+    raw = re.sub(r"^```", "", raw)
+    raw = re.sub(r"```$", "", raw)
+    return raw.strip()

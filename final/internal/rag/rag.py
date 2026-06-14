@@ -1,6 +1,7 @@
 # rag — 检索增强生成（RAG）：Milvus 语义 + ES BM25 + Neo4j 图 + 三路 RRF 融合
 import json
 import logging
+import hashlib
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -9,38 +10,10 @@ from internal.graph.kgstore import KGStore
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient
 from internal.rag.hybrid import HybridStore
+from internal.rag.rewriter import HistoryMessage
+from internal.rag.splitter import Chunk, RecursiveSplitter
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Chunk:
-    id: int
-    content: str
-
-
-class TextSplitter:
-    """按字符窗口切分文本。"""
-
-    def __init__(self, chunk_size: int = 200, overlap: int = 50):
-        self.chunk_size = max(1, chunk_size)
-        self.overlap = max(0, min(overlap, self.chunk_size - 1))
-
-    def split(self, text: str) -> List[Chunk]:
-        if not text:
-            return []
-        step = self.chunk_size - self.overlap
-        chunks: List[Chunk] = []
-        idx = 0
-        i = 0
-        while i < len(text):
-            end = min(i + self.chunk_size, len(text))
-            chunks.append(Chunk(id=idx, content=text[i:end]))
-            idx += 1
-            if end >= len(text):
-                break
-            i += step
-        return chunks
 
 
 class Engine:
@@ -49,9 +22,14 @@ class Engine:
     def __init__(self, cfg: APIConfig, inf: Infrastructure, llm: Optional[LLMClient] = None):
         self.cfg = cfg
         self.inf = inf
-        self.splitter = TextSplitter(cfg.chunk_size, cfg.chunk_overlap)
+        parent_size = max(cfg.chunk_size * 4, 600)
+        parent_overlap = cfg.chunk_overlap * 2
+        self.parent_splitter = RecursiveSplitter(parent_size, parent_overlap)
+        self.child_splitter = RecursiveSplitter(cfg.chunk_size, cfg.chunk_overlap)
         self.loaded = False
         self._generate_fn: Optional[Callable[[str, str], str]] = None
+        self._rewriter = None
+        self._reranker = None
         # 复用 agent 注入的 LLM 客户端，避免重复实例
         self._llm = llm if llm is not None else LLMClient(cfg)
         # 三路混合检索（Milvus + ES + KG），由 cfg.enable_hybrid_search 控制是否启用
@@ -62,6 +40,14 @@ class Engine:
 
     def set_generate_fn(self, fn: Callable[[str, str], str]):
         self._generate_fn = fn
+
+    def set_rewriter(self, rewriter) -> None:
+        self._rewriter = rewriter
+
+    def set_reranker(self, reranker) -> None:
+        self._reranker = reranker
+        if self._hybrid is not None:
+            self._hybrid.set_reranker(reranker)
 
     def set_kg_store(self, kg: Optional[KGStore]) -> None:
         """注入知识图谱存储（图路检索的第三路）。
@@ -82,7 +68,14 @@ class Engine:
     # ── 入库 ────────────────────────────────────────────────────────────────
 
     def ingest(self, doc: str) -> int:
-        chunks = self.splitter.split(doc)
+        parents = self.parent_splitter.split(doc)
+        chunks: List[Chunk] = []
+        child_parents: List[str] = []
+        for parent in parents:
+            for child in self.child_splitter.split(parent.content):
+                child.id = len(chunks)
+                chunks.append(child)
+                child_parents.append(parent.content)
         if not chunks:
             return 0
 
@@ -92,9 +85,15 @@ class Engine:
         pg_ids: List[int] = []
         valid_contents: List[str] = []
         valid_embeddings: List[List[float]] = []
-        doc_hash = f"doc_{abs(hash(doc))}"
+        doc_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()[:16]
         for i, chunk in enumerate(chunks):
-            pg_id = self.inf.save_rag_chunk(doc_hash, i, chunk.content, json.dumps(embeddings[i]))
+            parent_content = child_parents[i] if i < len(child_parents) else ""
+            if hasattr(self.inf, "save_rag_chunk_with_parent"):
+                pg_id = self.inf.save_rag_chunk_with_parent(
+                    doc_hash, i, chunk.content, parent_content, json.dumps(embeddings[i])
+                )
+            else:
+                pg_id = self.inf.save_rag_chunk(doc_hash, i, chunk.content, json.dumps(embeddings[i]))
             if pg_id > 0:
                 pg_ids.append(pg_id)
                 valid_contents.append(chunk.content)
@@ -114,16 +113,30 @@ class Engine:
             self.inf.index_rag_chunk(pg_id, valid_contents[i], doc_hash, i)
 
         self.loaded = True
-        self.inf.publish_event("rag.ingest", json.dumps({"chunk_count": len(chunks)}))
+        self.inf.publish_event("rag.ingest", json.dumps({
+            "chunk_count": len(chunks),
+            "parent_count": len(parents),
+            "doc_hash": doc_hash,
+        }))
         return len(chunks)
 
     # ── 检索 ────────────────────────────────────────────────────────────────
 
     def query(self, question: str) -> Tuple[str, List[dict]]:
+        return self.query_with_history(question, [])
+
+    def query_with_history(self, question: str, history: Optional[List[HistoryMessage]] = None) -> Tuple[str, List[dict]]:
+        if not self.loaded:
+            return "知识库为空，请先上传文档。", []
         if self.inf.ready.postgresql != "connected":
             return "PostgreSQL 未连接，无法查询知识库。", []
 
         top_k = max(1, self.cfg.top_k)
+        queries = [question]
+        if self._rewriter is not None:
+            rewritten = self._rewriter.rewrite(question, history or [])
+            if rewritten:
+                queries = rewritten
 
         # 优先走三路混合检索（开关：cfg.enable_hybrid_search）。
         # 仅在 ES + Milvus 都连接时启用，否则降级到单路语义/关键词或老 RRF 路径。
@@ -133,17 +146,18 @@ class Engine:
             and self.inf.ready.milvus == "connected"
             and self._llm.cfg.is_real_embedding()
         ):
-            hybrid_hits = self._hybrid.search(question, top_k)
+            hybrid_hits = self._hybrid.search_multi(queries, top_k)
             fused = [
                 {
                     "pg_id": h.pg_id,
-                    "content": h.content,
+                    "content": h.parent or h.content,
                     "score": h.score,
                     "source": h.source,
                 }
                 for h in hybrid_hits
             ]
-            return self._compose_answer(question, fused)
+            ask_query = queries[0] if queries else question
+            return self._compose_answer(ask_query, fused)
 
         # 仅当 Milvus 真实连接且 embedding 真实可用时使用语义路
         milvus_results: List[dict] = []
