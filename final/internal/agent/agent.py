@@ -123,6 +123,11 @@ class UnifiedAgent:
         # 默认工具集；planner / sandbox 可后续追加
         self.tool_executor = ToolExecutor(default_tools(cfg=cfg, llm=self.llm))
 
+        # 注册依赖 agent 上下文的内置工具（rag_search 闭包，与 Go 版
+        # registerBuiltinTools 对齐）。search_web 已在 default_tools 中
+        # 通过 search_web_factory 处理 Tavily / LLM 降级，无需重复注册。
+        self._register_builtin_tools()
+
         self.max_iterations = cfg.max_iterations
         self.max_retries = cfg.max_retries
 
@@ -208,6 +213,30 @@ class UnifiedAgent:
 
     def add_tool(self, tool: Tool):
         self.tool_executor.add_tool(tool)
+
+    def _register_builtin_tools(self) -> None:
+        """注册依赖 agent 自身字段的内置工具。
+
+        与 Go 版 UnifiedAgent.registerBuiltinTools 对齐：
+        rag_search 必须在 self.rag 构造之后注册，因为闭包要捕获 self.rag。
+        """
+        def _rag_search(params: Dict[str, Any]) -> str:
+            query = params.get("query", "") if isinstance(params, dict) else ""
+            if not query:
+                query = "相关内容"
+            if self.rag is None:
+                raise RuntimeError("RAG 引擎未初始化")
+            if not getattr(self.rag, "loaded", False):
+                raise RuntimeError("知识库为空，请先在「私人黑洞」上传文档")
+            answer, _ = self._run_rag_query(query)
+            return answer
+
+        self.tool_executor.add_tool(Tool(
+            name="rag_search",
+            description="从私人黑洞（个人知识库）中检索相关文档内容",
+            params=[{"name": "query", "type": "string", "description": "检索关键词或问题"}],
+            func=_rag_search,
+        ))
 
     def register_mcp_tool(self, name: str, description: str, params: List[Dict[str, str]], func):
         self.add_tool(new_mcp_tool(name, description, params, func))

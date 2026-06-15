@@ -43,16 +43,20 @@ def init_sandbox(agent):
 
         sb = Sandbox(agent.cfg.sandbox_backend, sb_cfg, sec_cfg)
 
-        # 审计：将每条命令执行结果发送到 Kafka
+        # 审计：将每条命令执行结果发送到 Kafka（字段对齐 Go 版 initSandbox）
         def _audit(r):
             try:
+                validation = getattr(r, "validation", None)
                 event = {
                     "command": getattr(r, "command", ""),
+                    "level": getattr(validation, "level", "") if validation else "",
                     "exit_code": getattr(r, "exit_code", None),
                     "duration_ms": int(getattr(r, "duration_ms", 0) or 0),
                     "backend": getattr(r, "backend", ""),
                     "killed": getattr(r, "killed", False),
                     "truncated": getattr(r, "truncated", False),
+                    "reason": getattr(validation, "reason", "") if validation else "",
+                    "violations": list(getattr(validation, "violations", []) or []) if validation else [],
                 }
                 _publish_event(agent, "sandbox.exec", json.dumps(event, ensure_ascii=False))
             except Exception as e:

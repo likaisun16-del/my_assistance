@@ -1,7 +1,10 @@
 # tools — 工具定义、调用与注册（Python 版与 main 分支 Go 版 tools.go 对齐）
 #
-# 在保留 Python 版 ReAct 工具集合（get_time / get_weather / search_web / rag_search）
-# 的基础上，新增以下能力：
+# 内置工具集合（与 Go 版 toolimpl.DefaultTools 对齐）：get_time / get_weather / search_web。
+# 注意 rag_search 不在此处注册——它依赖 Agent 持有的 RAG 引擎实例，
+# 由 internal/agent/agent.py 的 _register_builtin_tools 在 agent 启动期动态注入闭包。
+#
+# 此外提供以下能力：
 #   - exec_command：通过 sandbox 在隔离环境执行终端命令
 #   - tavily：调用 Tavily Search API（search_web 双层降级：tavily → LLM → mock）
 #   - decide：基于关键字的简单工具选择器（对应 Go 版 tools.Decide）
@@ -131,8 +134,13 @@ def search_web(args: Dict[str, Any]) -> str:
 
 
 def rag_search(args: Dict[str, Any]) -> str:
+    """占位实现：Agent 在启动期会用真实闭包覆盖。
+
+    保留同名函数仅为兼容旧调用路径（直接 import 的测试代码）；
+    生产路径下 default_tools() 不再注册它，由 Agent._register_builtin_tools 注入。
+    """
     query = args.get("query", "") if isinstance(args, dict) else ""
-    return f"知识库检索结果：关于 '{query}' 的相关知识...（需要连接 RAG 引擎）"
+    return f"知识库未就绪：'{query}'（请通过 Agent 注入真实 rag_search 闭包）"
 
 
 # ─────────────────────────────── tavily / exec_command 工具 ──────────────────
@@ -187,15 +195,18 @@ def build_exec_command_tool(sandbox) -> Optional[Tool]:
 # ─────────────────────────────── 默认工具集 ──────────────────────────────────
 
 def default_tools(cfg=None, llm=None, sandbox=None) -> List[Tool]:
-    """返回默认工具集合。
+    """返回默认工具集合（与 Go 版 toolimpl.DefaultTools 对齐）。
 
     Args:
         cfg:     APIConfig 实例。提供后 search_web 将启用 Tavily / LLM 双层降级。
         llm:     LLM 客户端（提供 chat 方法）。用于 search_web 的 LLM 降级。
         sandbox: sandbox.Sandbox 实例。提供后会自动注册 exec_command 工具。
 
-    返回的 Tool 列表包含：get_time / get_weather / search_web / rag_search，
+    返回的 Tool 列表包含：get_time / get_weather / search_web；
     并在条件满足时追加 tavily 与 exec_command。
+
+    注意：rag_search 不在默认工具集中，因为它依赖 Agent 的 RAG 引擎实例，
+    由 internal/agent/agent.py 的 _register_builtin_tools 在 agent 启动期动态注入。
     """
     search_func = search_web_factory(cfg=cfg, llm=llm) if (cfg is not None or llm is not None) else search_web
 
@@ -212,12 +223,6 @@ def default_tools(cfg=None, llm=None, sandbox=None) -> List[Tool]:
             description="执行网络搜索（Tavily → LLM 知识库 → mock 三层降级）",
             params=[{"name": "query", "type": "string", "description": "搜索关键词"}],
             func=search_func,
-        ),
-        Tool(
-            name="rag_search",
-            description="在知识库中检索相关信息",
-            params=[{"name": "query", "type": "string", "description": "检索关键词"}],
-            func=rag_search,
         ),
     ]
 
