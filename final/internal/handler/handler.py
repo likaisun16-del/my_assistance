@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from config.config import APIConfig
 from internal.agent.agent import ChatOptions, Response, UnifiedAgent
+from internal.agent.script_generator import ScriptGenerator, ScriptRequest
 from internal.infra.infra import Infrastructure
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,13 @@ class DocsDeleteRequest(BaseModel):
 
 class UploadJSONRequest(BaseModel):
     content: str = Field(..., min_length=1)
+
+
+class ScriptGenerateRequest(BaseModel):
+    topic: str = Field(..., min_length=1)
+    duration: int = 120
+    style: str = "口播"
+    user_id: Optional[str] = None
 
 
 # ─── 工具函数 ───────────────────────────────────────────────────────────────
@@ -223,6 +231,23 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
             raise
         except Exception as e:
             logger.error("注册 MCP 工具失败: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/script/generate")
+    async def script_generate(req: ScriptGenerateRequest):
+        try:
+            gen = ScriptGenerator(llm=agent.llm)
+            out = gen.generate(ScriptRequest(topic=req.topic, duration=req.duration, style=req.style))
+            return {
+                "hook": out.hook,
+                "body": out.body,
+                "cta": out.cta,
+                "duration_estimate": out.duration_estimate,
+            }
+        except ValueError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            logger.error("脚本生成失败: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/status")
