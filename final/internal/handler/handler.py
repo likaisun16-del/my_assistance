@@ -1,11 +1,14 @@
 # handler — HTTP API 路由处理（FastAPI + Pydantic + CORS）
 import logging
 import os
+import hashlib
+import json
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -94,7 +97,7 @@ def _response_to_dict(resp: Response) -> Dict[str, Any]:
             for s in resp.steps
         ],
         "tool_call": resp.tool_call,
-        "search_results": resp.search_results,
+        "search_results": [_rag_result_to_main_contract(r) for r in resp.search_results],
         "task": resp.task,
         "extracted_info": resp.extracted_info,
         "short_term_count": resp.short_term_count,
@@ -103,6 +106,40 @@ def _response_to_dict(resp: Response) -> Dict[str, Any]:
         "interrupted": resp.interrupted,
         "success": True,
     }
+
+
+def _rag_result_to_main_contract(result: Dict[str, Any]) -> Dict[str, Any]:
+    content = result.get("content", "")
+    score = result.get("score", result.get("similarity", 0.0))
+    try:
+        similarity = float(score)
+    except Exception:
+        similarity = 0.0
+    return {
+        **result,
+        "content": content,
+        "score": score,
+        "similarity": similarity,
+        "chunk": result.get("chunk") or {"content": content},
+        "source": result.get("source", "unknown"),
+    }
+
+
+def _tool_to_main_contract(tool: Dict[str, Any]) -> Dict[str, Any]:
+    """兼容 Go main 分支前端：工具参数字段叫 params。"""
+    params = tool.get("params")
+    if params is None:
+        params = tool.get("parameters", [])
+    return {
+        "name": tool.get("name", ""),
+        "description": tool.get("description", tool.get("desc", "")),
+        "is_mcp": tool.get("is_mcp", False),
+        "params": params or [],
+    }
+
+
+def _sse(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 # ─── 路由组装 ───────────────────────────────────────────────────────────────
@@ -146,6 +183,41 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
             logger.error("聊天接口错误: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.post("/api/chat/stream")
+    async def chat_stream(req: ChatRequest):
+        async def events():
+            yield _sse("start", {"message": req.message})
+            opts = ChatOptions(
+                use_rag=req.use_rag,
+                selected_tools=req.selected_tools,
+                explicit=req.explicit,
+            )
+            try:
+                resp = agent.process_with_options(req.message, opts)
+                data = _response_to_dict(resp)
+                yield _sse("route", {"mode": resp.mode})
+                if resp.extracted_info:
+                    yield _sse("memory", {"extracted_info": resp.extracted_info})
+                for step in resp.steps:
+                    yield _sse("step", {
+                        "type": step.type,
+                        "content": step.content,
+                        "tool": step.tool,
+                        "params": step.params,
+                    })
+                if resp.tool_call:
+                    yield _sse("tool_call", resp.tool_call)
+                if resp.search_results:
+                    yield _sse("rag_result", {"search_results": data["search_results"]})
+                if resp.answer:
+                    yield _sse("token", {"content": resp.answer})
+                yield _sse("done", data)
+            except Exception as e:
+                logger.error("流式聊天接口错误: %s", e)
+                yield _sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False})
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
     @app.post("/api/chat/cancel")
     async def chat_cancel():
         try:
@@ -169,14 +241,30 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/api/upload")
-    async def upload(file: UploadFile = File(...)):
+    async def upload(request: Request):
         try:
-            content = await file.read()
-            text = extract_text_from_file(file, content)
+            content_type = request.headers.get("content-type", "")
+            if "application/json" in content_type:
+                payload = await request.json()
+                text = str((payload or {}).get("content", ""))
+            else:
+                form = await request.form()
+                file = form.get("file")
+                if file is None:
+                    raise HTTPException(status_code=400, detail="缺少 file 或 content")
+                content = await file.read()
+                text = extract_text_from_file(file, content)
+
             if not text.strip():
-                return {"chunk_count": 0, "success": False, "message": "文件内容为空"}
-            chunk_count = agent.rag_ingest(text)
-            return {"chunk_count": chunk_count, "success": True}
+                return {"chunk_count": 0, "doc_hash": "", "success": False, "message": "文件内容为空"}
+            ingest_result = agent.rag_ingest(text)
+            if isinstance(ingest_result, tuple):
+                chunk_count, doc_hash = ingest_result
+            else:
+                chunk_count, doc_hash = ingest_result, ""
+            if not doc_hash:
+                doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            return {"chunk_count": chunk_count, "doc_hash": doc_hash, "success": True}
         except HTTPException:
             raise
         except Exception as e:
@@ -239,7 +327,7 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
 
     @app.get("/api/tools")
     async def tools():
-        return {"tools": agent.get_tools()}
+        return [_tool_to_main_contract(t) for t in agent.get_tools()]
 
     @app.get("/api/memory")
     async def memory():
