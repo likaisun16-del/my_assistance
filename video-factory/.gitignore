@@ -1,0 +1,11 @@
+# video-factory build artifacts
+bin/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# Local overrides
+configs/local.yaml
+configs/config.yaml
