@@ -80,6 +80,8 @@ class _FakeInfra:
     def __init__(self):
         self.ready = SimpleNamespace(postgresql="connected", milvus="connected", elasticsearch="connected")
         self.saved_chunks = []
+        self.indexed_chunks = []
+        self.inserted_milvus = []
         self.rows = {
             1: {"id": 1, "content": "child a", "parent_content": "parent A"},
             2: {"id": 2, "content": "child b", "parent_content": "parent B"},
@@ -119,11 +121,16 @@ class _FakeInfra:
     def save_rag_chunk(self, doc_hash, chunk_idx, content, embedding_json):
         return self.save_rag_chunk_with_parent(doc_hash, chunk_idx, content, "", embedding_json)
 
-    def insert_rag_chunks(self, _pg_ids, _contents, _embeddings):
-        return None
+    def insert_rag_chunks(self, pg_ids, contents, embeddings):
+        self.inserted_milvus.append((pg_ids, contents, embeddings))
 
-    def index_rag_chunk(self, _pg_id, _content, _doc_hash, _chunk_idx):
-        return None
+    def index_rag_chunk(self, pg_id, content, doc_hash, chunk_idx):
+        self.indexed_chunks.append({
+            "pg_id": pg_id,
+            "content": content,
+            "doc_hash": doc_hash,
+            "chunk_idx": chunk_idx,
+        })
 
     def publish_event(self, event_type, payload):
         self.events.append((event_type, payload))
@@ -195,3 +202,49 @@ def test_engine_query_with_history_uses_rewrite_search_multi_and_parent_context(
     assert "parent A" in captured["user_msg"]
     assert "parent B" in captured["user_msg"]
     assert [r["content"] for r in results] == ["parent A", "parent B"]
+
+
+class _FailingEmbedLLM:
+    cfg = _FakeCfg()
+
+    def embed(self, _text):
+        raise RuntimeError("embedding service down")
+
+
+def test_engine_ingest_saves_pg_and_es_when_embedding_fails():
+    inf = _FakeInfra()
+    engine = Engine(_FakeCfg(), inf, _FailingEmbedLLM())
+
+    count = engine.ingest("abcdefghijklmnopqrstuvwxyz")
+
+    assert count == len(inf.saved_chunks)
+    assert len(inf.indexed_chunks) == count
+    assert inf.inserted_milvus == []
+    assert all(row["embedding_json"] == "[]" for row in inf.saved_chunks)
+
+
+def test_engine_compose_answer_deduplicates_same_display_content():
+    engine = Engine(_FakeCfg(), _FakeInfra(), _FakeLLM())
+
+    answer, results = engine._compose_answer("question", [
+        {"pg_id": 1, "content": "same parent", "score": 0.9, "source": "keyword"},
+        {"pg_id": 2, "content": "same parent", "score": 0.8, "source": "semantic"},
+        {"pg_id": 3, "content": "other parent", "score": 0.7, "source": "keyword"},
+    ])
+
+    assert "same parent" in answer
+    assert [r["content"] for r in results] == ["same parent", "other parent"]
+
+
+def test_llm_embed_does_not_return_mock_vector_when_unconfigured():
+    from config.config import APIConfig
+    from internal.llm.llm import Client
+
+    client = Client(APIConfig())
+
+    try:
+        client.embed("hello")
+    except RuntimeError as e:
+        assert "未配置" in str(e)
+    else:
+        raise AssertionError("embed should raise instead of returning a mock vector")

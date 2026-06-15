@@ -18,10 +18,6 @@ class Message:
     content: str
 
 
-# Mock 向量维度（无 API Key 时使用）；务必与 cfg.rag_milvus_dim / config.yaml 中真实模型维度区分
-MOCK_EMBED_DIM = 768
-
-
 class Client:
     """LLM 客户端封装：OpenAI 兼容 Chat Completions + 火山方舟多模态 Embedding。"""
 
@@ -80,14 +76,10 @@ class Client:
     # ── Embedding ───────────────────────────────────────────────────────────
 
     def embed(self, text: str) -> List[float]:
-        """文本向量化；未配置或调用失败时返回 Mock 向量。"""
+        """文本向量化；与 Go 主分支一致：失败时抛错，由调用方决定是否降级。"""
         if not self.cfg.is_real_embedding():
-            return self._mock_embed(text)
-        try:
-            return self._call_embed(text)
-        except Exception as e:
-            logger.error("Embedding API 调用失败: %s，回退到 Mock", e)
-            return self._mock_embed(text)
+            raise RuntimeError("embedding API 未配置")
+        return self._call_embed(text)
 
     def _call_embed(self, text: str) -> List[float]:
         api_url = self.cfg.embedding_api_url
@@ -122,10 +114,6 @@ class Client:
         if not embedding:
             raise RuntimeError("embedding 返回空向量")
         return embedding
-
-    def _mock_embed(self, text: str) -> List[float]:
-        h = hash(text)
-        return [((h * (i + 1)) % 1000) / 1000.0 for i in range(MOCK_EMBED_DIM)]
 
     # ── Preference Extraction ──────────────────────────────────────────────
 

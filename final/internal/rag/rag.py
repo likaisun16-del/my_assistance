@@ -79,38 +79,49 @@ class Engine:
         if not chunks:
             return 0
 
-        contents = [c.content for c in chunks]
-        embeddings = [self._llm.embed(content) for content in contents]
-
         pg_ids: List[int] = []
         valid_contents: List[str] = []
         valid_embeddings: List[List[float]] = []
         doc_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()[:16]
         for i, chunk in enumerate(chunks):
+            embedding: List[float] = []
+            try:
+                embedding = self._llm.embed(chunk.content)
+            except Exception as e:
+                logger.warning("⚠️  RAG chunk 向量化失败，跳过 Milvus 写入 (idx=%d): %s", i, e)
+
             parent_content = child_parents[i] if i < len(child_parents) else ""
             if hasattr(self.inf, "save_rag_chunk_with_parent"):
                 pg_id = self.inf.save_rag_chunk_with_parent(
-                    doc_hash, i, chunk.content, parent_content, json.dumps(embeddings[i])
+                    doc_hash, i, chunk.content, parent_content, json.dumps(embedding)
                 )
             else:
-                pg_id = self.inf.save_rag_chunk(doc_hash, i, chunk.content, json.dumps(embeddings[i]))
+                pg_id = self.inf.save_rag_chunk(doc_hash, i, chunk.content, json.dumps(embedding))
             if pg_id > 0:
                 pg_ids.append(pg_id)
                 valid_contents.append(chunk.content)
-                valid_embeddings.append(embeddings[i])
+                valid_embeddings.append(embedding)
+                if self.inf.ready.elasticsearch == "connected":
+                    try:
+                        self.inf.index_rag_chunk(pg_id, chunk.content, doc_hash, i)
+                    except Exception as e:
+                        logger.warning("⚠️  RAG chunk 索引到 ES 失败 (pg_id=%s): %s", pg_id, e)
 
         # 仅在 Milvus 真实连接 + embedding 维度匹配时才插入
-        if (
-            self.inf.ready.milvus == "connected"
-            and pg_ids
-            and self._llm.cfg.is_real_embedding()
-            and valid_embeddings
-            and len(valid_embeddings[0]) == self.cfg.rag_milvus_dim
-        ):
-            self.inf.insert_rag_chunks(pg_ids, valid_contents, valid_embeddings)
-
-        for i, pg_id in enumerate(pg_ids):
-            self.inf.index_rag_chunk(pg_id, valid_contents[i], doc_hash, i)
+        milvus_ids: List[int] = []
+        milvus_contents: List[str] = []
+        milvus_embeddings: List[List[float]] = []
+        if self.inf.ready.milvus == "connected":
+            for pg_id, content, embedding in zip(pg_ids, valid_contents, valid_embeddings):
+                if embedding and len(embedding) == self.cfg.rag_milvus_dim:
+                    milvus_ids.append(pg_id)
+                    milvus_contents.append(content)
+                    milvus_embeddings.append(embedding)
+        if milvus_ids:
+            try:
+                self.inf.insert_rag_chunks(milvus_ids, milvus_contents, milvus_embeddings)
+            except Exception as e:
+                logger.warning("⚠️  RAG chunks 写入 Milvus 失败: %s", e)
 
         self.loaded = True
         self.inf.publish_event("rag.ingest", json.dumps({
@@ -179,6 +190,7 @@ class Engine:
         return self._compose_answer(question, fused)
 
     def _compose_answer(self, question: str, fused: List[dict]) -> Tuple[str, List[dict]]:
+        fused = self._dedupe_results_by_content(fused)
         if not fused:
             return "知识库中未找到相关内容。", []
 
@@ -195,6 +207,19 @@ class Engine:
             return self._generate_fn(system_prompt, user_msg), fused
 
         return f"【知识库检索结果】\n{context}", fused
+
+    def _dedupe_results_by_content(self, results: List[dict]) -> List[dict]:
+        seen = set()
+        deduped: List[dict] = []
+        for item in results:
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            if content in seen:
+                continue
+            seen.add(content)
+            deduped.append(item)
+        return deduped
 
     def _rrf_fuse(
         self,

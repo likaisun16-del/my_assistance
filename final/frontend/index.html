@@ -1201,9 +1201,13 @@ function buildReply(data) {
 
     if (hasRAG) {
       bodyHtml += `<div class="rag-sources">`;
+      const seen = new Set();
       for (const r of data.search_results.slice(0, 3)) {
+        const content = ((r.chunk && r.chunk.content) || r.content || '').trim();
+        if (!content || seen.has(content)) continue;
+        seen.add(content);
         const score = (r.similarity * 100).toFixed(1);
-        const preview = (r.chunk && r.chunk.content) ? r.chunk.content.slice(0, 120) : '';
+        const preview = content.slice(0, 120);
         bodyHtml += `<div class="rag-chunk"><span class="rag-chunk-score">相关度 ${score}%</span>${escHtml(preview)}${preview.length >= 120 ? '…' : ''}</div>`;
       }
       bodyHtml += `</div>`;
