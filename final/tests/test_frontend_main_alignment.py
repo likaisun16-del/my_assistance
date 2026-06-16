@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from config.config import APIConfig
@@ -172,3 +173,24 @@ def test_chat_stream_emits_sse_events_for_main_frontend():
     assert "event: route" in body
     assert "event: token" in body
     assert "event: done" in body
+
+
+def test_legacy_rag_query_route_removed_to_match_main_branch():
+    status, _payload = _request(
+        _client(),
+        "POST",
+        "/api/rag/query",
+        json.dumps({"question": "old route"}).encode(),
+    )
+
+    assert status in {404, 405}
+
+
+def test_frontend_contains_local_document_library_ui():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "libraryDocList" in html
+    assert "docViewer" in html
+    assert "loadLibraryDocs" in html
+    assert "fetchDocumentJSON('/api/documents')" in html
+    assert "/api/documents/' + encodeURIComponent(id) + '/ingest" in html
