@@ -1,6 +1,7 @@
 # sandbox 包导出
 from .docker import DockerSandbox
 from .executor import Executor, Sandbox, SandboxUnavailableError
+from .factory import create_sandbox
 from .local import LocalSandbox, MockSandbox
 from .types import (
     ExecRequest,
@@ -19,6 +20,7 @@ __all__ = [
     "Sandbox",
     "Executor",
     "SandboxUnavailableError",
+    "create_sandbox",
     "DockerSandbox",
     "LocalSandbox",
     "MockSandbox",

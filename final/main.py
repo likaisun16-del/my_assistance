@@ -9,6 +9,7 @@
 import logging
 import os
 import sys
+from dataclasses import dataclass
 
 # 把项目根（final/）加入 sys.path，让 `config.config` / `internal.*` 可被绝对导入
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -30,22 +31,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main():
+@dataclass
+class Deps:
+    cfg: object
+    inf: Infrastructure
+    agent: UnifiedAgent
+    app: object
+
+
+def build_deps():
     cfg = default_config()
-
-    logger.info("🔧 正在连接基础设施...")
     inf = Infrastructure(cfg)
+    agent = UnifiedAgent(cfg, inf)
+    app = setup_routes(agent, inf, cfg)
+    return Deps(cfg=cfg, inf=inf, agent=agent, app=app)
 
+
+def main():
+    deps = None
     try:
-        agent = UnifiedAgent(cfg, inf)
-        app = setup_routes(agent, inf, cfg)
-        print_banner(cfg, inf)
+        deps = build_deps()
+        print_banner(deps.cfg, deps.inf)
 
         import uvicorn
 
-        uvicorn.run(app, host="0.0.0.0", port=int(cfg.server_port))
+        uvicorn.run(deps.app, host="0.0.0.0", port=int(deps.cfg.server_port))
     finally:
-        inf.close()
+        if deps is not None:
+            try:
+                deps.inf.close()
+            except Exception:
+                pass
 
 
 def print_banner(cfg, inf):

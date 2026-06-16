@@ -225,6 +225,40 @@ def rule_plan_items(agent, query: str, tools_map: Dict[str, Any]) -> List[PlanIt
 
 def rule_plan_nodes(agent, query: str, tools_map: Dict[str, Any]) -> List[Node]:
     """关键字规则降级规划，返回图节点。"""
+    if _looks_like_document_workflow(query):
+        return [
+            Node(
+                id="n1",
+                type=NodeType.SUBAGENT,
+                name="研究资料",
+                tool_name="research_agent",
+                params={"goal": query},
+            ),
+            Node(
+                id="n2",
+                type=NodeType.SUBAGENT,
+                name="撰写报告",
+                tool_name="writer_agent",
+                params={"goal": query},
+                depends_on=["n1"],
+            ),
+            Node(
+                id="n3",
+                type=NodeType.SUBAGENT,
+                name="审查报告",
+                tool_name="review_agent",
+                params={"goal": query},
+                depends_on=["n2"],
+            ),
+            Node(
+                id="n4",
+                type=NodeType.SUBAGENT,
+                name="保存文档",
+                tool_name="doc_agent",
+                params={"goal": query},
+                depends_on=["n2", "n3"],
+            ),
+        ]
     items = rule_plan_items(agent, query, tools_map)
     nodes: List[Node] = []
     for idx, item in enumerate(items):
@@ -239,6 +273,13 @@ def rule_plan_nodes(agent, query: str, tools_map: Dict[str, Any]) -> List[Node]:
             race_group=race_group,
         ))
     return nodes
+
+
+def _looks_like_document_workflow(query: str) -> bool:
+    q = (query or "").lower()
+    return any(k in q for k in ["报告", "文档", "保存到文档库", "写成markdown", "markdown", "调研"]) and any(
+        k in q for k in ["生成", "撰写", "写", "保存", "调研", "总结"]
+    )
 
 
 def _clean_json(raw: str) -> str:

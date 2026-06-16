@@ -9,6 +9,7 @@
 #   - tavily：调用 Tavily Search API（search_web 双层降级：tavily → LLM → mock）
 #   - decide：基于关键字的简单工具选择器（对应 Go 版 tools.Decide）
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -232,19 +233,31 @@ def default_tools(cfg=None, llm=None, sandbox=None) -> List[Tool]:
 # ─────────────────────────────── 工具调用器 ──────────────────────────────────
 
 class ToolExecutor:
-    """与 main 分支 Go 版接口对齐的工具执行器。"""
+    """与 main 分支 Go 版接口对齐的工具执行器。
+
+    内部用 ``threading.RLock`` 串行化 ``_tool_map`` 的读写。多路并发调用方：
+      - register / add_tool（写）
+      - call / get_tool_descriptions / snapshot / filter_tools / 路由侧
+        ``self.tool_executor._tool_map`` 直读（读）
+
+    与 main toolRegistry 对齐：写持锁；读经 ``snapshot``/``filter_tools``
+    返回浅拷贝供调用方无锁遍历。``call`` 内部以一次 snapshot 查询 + 锁外
+    执行 ``tool.func`` 的方式，避免长时占锁。
+    """
 
     def __init__(self, tools: Optional[List[Tool]] = None):
         self.tools = tools if tools else default_tools()
+        self._lock = threading.RLock()
         self._tool_map = {t.name: t for t in self.tools}
 
     def call(self, tool_name: str, args: Dict[str, Any]) -> CallResult:
-        if tool_name not in self._tool_map:
+        with self._lock:
+            tool = self._tool_map.get(tool_name)
+        if tool is None:
             return CallResult(
                 success=False, content="", error=f"工具 {tool_name} 不存在",
                 tool_name=tool_name, params=args or {},
             )
-        tool = self._tool_map[tool_name]
         try:
             result = tool.func(args or {})
             return CallResult(success=True, content=str(result), tool_name=tool_name, params=args or {})
@@ -256,8 +269,10 @@ class ToolExecutor:
             )
 
     def get_tool_descriptions(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            tools = list(self.tools)
         out: List[Dict[str, Any]] = []
-        for tool in self.tools:
+        for tool in tools:
             out.append({
                 "name": tool.name,
                 "description": tool.description,
@@ -274,8 +289,23 @@ class ToolExecutor:
         return out
 
     def add_tool(self, tool: Tool) -> None:
-        self.tools.append(tool)
-        self._tool_map[tool.name] = tool
+        with self._lock:
+            existed = tool.name in self._tool_map
+            self._tool_map[tool.name] = tool
+            if existed:
+                # 覆盖既有同名工具：保持 self.tools 唯一性
+                self.tools = [t for t in self.tools if t.name != tool.name]
+            self.tools.append(tool)
+
+    def snapshot(self) -> Dict[str, Tool]:
+        """返回 _tool_map 的浅拷贝，供调用方无锁遍历（对应 main snapshot）。"""
+        with self._lock:
+            return dict(self._tool_map)
+
+    def filter_tools(self, names: List[str]) -> Dict[str, Tool]:
+        """按名单返回 _tool_map 的子集（对应 main filter）。"""
+        with self._lock:
+            return {n: self._tool_map[n] for n in names if n in self._tool_map}
 
 
 # ─────────────────────────────── 工具选择器 ──────────────────────────────────

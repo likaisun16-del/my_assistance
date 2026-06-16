@@ -84,6 +84,28 @@ def test_graph_runtime_race_group_first_success_wins():
     assert graph.nodes["n1"].status in {NodeStatus.SKIPPED, NodeStatus.CANCELLED}
 
 
+def test_graph_runtime_race_group_cancels_shared_token_on_first_success():
+    token = CancelToken()
+    tools = {
+        "slow": _Tool(lambda _params: time.sleep(0.05) or "slow"),
+        "fast": _Tool(lambda _params: "fast"),
+    }
+    graph = TaskGraph([
+        Node(id="n1", type=NodeType.TOOL, tool_name="slow", race_group="search"),
+        Node(id="n2", type=NodeType.TOOL, tool_name="fast", race_group="search"),
+    ])
+
+    GraphRuntime(
+        graph,
+        _Agent(),
+        GraphConfig(max_parallel=2, enable_racing=True),
+        tools,
+        {"task_id": "t1"},
+    ).execute(token)
+
+    assert token.is_cancelled() is True
+
+
 def test_graph_runtime_retries_and_records_failure():
     attempts = {"count": 0}
 

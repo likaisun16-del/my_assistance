@@ -1,8 +1,8 @@
 # longterm — 长期记忆条目仓储（Postgres 实现）。
 import json
 import logging
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import List, Optional
 
 from internal.platform.postgres import PostgresClient
@@ -17,11 +17,23 @@ class Row:
     content: str = ""
     importance: float = 0.0
     embedding: List[float] = field(default_factory=list)
-    created_at: Optional[datetime] = None
-    last_accessed: Optional[datetime] = None
+    created_at: float = 0.0
+    last_accessed: float = 0.0
     category: str = ""
     tags: List[str] = field(default_factory=list)
     slot_hint: str = ""
+    score: float = 0.0
+
+
+def _emb_to_str(embedding_json) -> str:
+    if isinstance(embedding_json, (bytes, bytearray)):
+        try:
+            return bytes(embedding_json).decode("utf-8")
+        except Exception:
+            return "[]"
+    if embedding_json is None:
+        return "null"
+    return embedding_json
 
 
 class PGRepo:
@@ -30,32 +42,33 @@ class PGRepo:
     def __init__(self, client: PostgresClient):
         self.client = client
 
-    # 默认分类 "general" 写入
-    def save(self, content: str, importance: float, embedding_json: bytes) -> int:
-        return self.save_classified(content, importance, embedding_json, "general", None, "")
-
-    # 带分类信息写入
-    def save_classified(self, content: str, importance: float, embedding_json: bytes,
-                        category: str, tags: Optional[List[str]], slot_hint: str) -> int:
+    # 默认写入：补齐时间戳，其余字段留默认（category/tags/slot_hint/score 由 store_classified 真填）
+    def save(self, content: str, importance: float, embedding_json,
+             created_at: Optional[float] = None,
+             last_accessed: Optional[float] = None,
+             category: str = "",
+             tags: Optional[List[str]] = None,
+             slot_hint: str = "",
+             score: float = 0.0) -> int:
         if self.client is None or not self.client.is_real() or self.client.conn is None:
             return -1
-        if not category:
-            category = "general"
+        if created_at is None:
+            created_at = time.time()
+        if last_accessed is None:
+            last_accessed = created_at
         if tags is None:
             tags = []
-        # embedding 以 JSONB 写入；接受 bytes / str / 已序列化对象
-        emb_param = embedding_json
-        if isinstance(emb_param, (bytes, bytearray)):
-            try:
-                emb_param = bytes(emb_param).decode("utf-8")
-            except Exception:
-                emb_param = "[]"
+        emb_param = _emb_to_str(embedding_json)
         try:
             with self.client.conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO long_term_memory (content, importance, embedding, category, tags, slot_hint) "
-                    "VALUES (%s, %s, %s, %s, %s, NULLIF(%s, '')) RETURNING id",
-                    (content, importance, emb_param, category, list(tags), slot_hint),
+                    "INSERT INTO long_term_memory "
+                    "(content, importance, embedding, created_at, last_accessed, "
+                    " category, tags, slot_hint, score) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s) RETURNING id",
+                    (content, importance, emb_param,
+                     float(created_at), float(last_accessed),
+                     category or "", json.dumps(list(tags)), slot_hint or "", float(score)),
                 )
                 row = cur.fetchone()
                 return int(row[0]) if row else -1
@@ -70,8 +83,9 @@ class PGRepo:
         try:
             rows = self.client.query(
                 "SELECT id, content, importance, embedding, "
-                "COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()), "
-                "COALESCE(category, 'general'), COALESCE(tags, '{}'::TEXT[]), COALESCE(slot_hint, '') "
+                "created_at, last_accessed, "
+                "COALESCE(category, ''), COALESCE(tags, '[]'::jsonb), "
+                "COALESCE(slot_hint, ''), COALESCE(score, 0.0) "
                 "FROM long_term_memory ORDER BY id"
             )
         except Exception as e:
@@ -80,9 +94,10 @@ class PGRepo:
         items: List[Row] = []
         for r in rows:
             try:
-                rid, content, importance, emb_json, created_at, last_accessed, category, tags, slot_hint = (
-                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
-                )
+                rid, content, importance, emb_json, created_at, last_accessed, \
+                    category, tags, slot_hint, score = (
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
+                    )
                 embedding: List[float] = []
                 if emb_json:
                     try:
@@ -94,39 +109,79 @@ class PGRepo:
                             embedding = emb_json
                     except Exception:
                         embedding = []
+                # tags: psycopg2 在 JSONB 列上通常直接返回 list；兼容 str 形式
+                if isinstance(tags, (bytes, bytearray)):
+                    try:
+                        tags = json.loads(bytes(tags).decode("utf-8"))
+                    except Exception:
+                        tags = []
+                elif isinstance(tags, str):
+                    try:
+                        tags = json.loads(tags)
+                    except Exception:
+                        tags = []
+                if not isinstance(tags, list):
+                    tags = []
+
+                def _to_ts(v):
+                    if v is None:
+                        return 0.0
+                    if hasattr(v, "timestamp"):
+                        try:
+                            return float(v.timestamp())
+                        except Exception:
+                            return 0.0
+                    try:
+                        return float(v)
+                    except Exception:
+                        return 0.0
+
                 items.append(Row(
                     id=int(rid),
                     content=content or "",
                     importance=float(importance) if importance is not None else 0.0,
                     embedding=embedding,
-                    created_at=created_at if isinstance(created_at, datetime) else None,
-                    last_accessed=last_accessed if isinstance(last_accessed, datetime) else None,
-                    category=category or "general",
-                    tags=list(tags) if tags else [],
+                    created_at=_to_ts(created_at),
+                    last_accessed=_to_ts(last_accessed),
+                    category=category or "",
+                    tags=[str(t) for t in tags],
                     slot_hint=slot_hint or "",
+                    score=float(score) if score is not None else 0.0,
                 ))
             except Exception:
                 continue
         return items
 
     # 修改一条长期记忆
-    def update(self, item_id: int, content: str, importance: float, embedding_json: bytes) -> None:
+    def update(self, item_id: int, content: str, importance: float, embedding_json) -> None:
         if self.client is None or not self.client.is_real():
             return
-        emb_param = embedding_json
-        if isinstance(emb_param, (bytes, bytearray)):
-            try:
-                emb_param = bytes(emb_param).decode("utf-8")
-            except Exception:
-                emb_param = "[]"
+        emb_param = _emb_to_str(embedding_json)
         try:
             self.client.exec(
                 "UPDATE long_term_memory SET content = %s, importance = %s, embedding = %s, "
-                "last_accessed = NOW() WHERE id = %s",
+                "last_accessed = EXTRACT(EPOCH FROM NOW()) WHERE id = %s",
                 (content, importance, emb_param, item_id),
             )
         except Exception as e:
             logger.warning("⚠️  长期记忆更新失败 (id=%d): %s", item_id, e)
+
+    # dedup 命中后只更新 Schema-driven 字段（不动 content/embedding）
+    def update_classified(self, item_id: int, importance: float,
+                          tags: List[str], category: str,
+                          slot_hint: str, last_accessed: float) -> None:
+        if self.client is None or not self.client.is_real():
+            return
+        try:
+            self.client.exec(
+                "UPDATE long_term_memory SET importance = %s, tags = %s::jsonb, "
+                "category = %s, slot_hint = %s, last_accessed = %s WHERE id = %s",
+                (float(importance), json.dumps(list(tags or [])),
+                 category or "", slot_hint or "",
+                 float(last_accessed), item_id),
+            )
+        except Exception as e:
+            logger.warning("⚠️  长期记忆 update_classified 失败 (id=%d): %s", item_id, e)
 
     # 批量删除
     def delete(self, ids: List[int]) -> None:

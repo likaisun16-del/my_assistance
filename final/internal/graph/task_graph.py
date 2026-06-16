@@ -5,7 +5,10 @@ from typing import Dict, List
 
 class NodeType(str, Enum):
     TOOL = "tool"
+    SUBAGENT = "subagent"
     LLM = "llm"
+    THINK = "think"
+    AGGREGATE = "aggregate"
 
 
 class NodeStatus(str, Enum):

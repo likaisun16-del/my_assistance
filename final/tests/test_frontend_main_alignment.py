@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from config.config import APIConfig
@@ -44,6 +45,20 @@ class _Agent:
         return "知识库回答:" + question, [{"content": "片段", "score": 0.8, "source": "test"}]
 
 
+class _SnapshotRepo:
+    def list(self, limit=50):
+        return []
+
+
+class _RagchunkRepo:
+    def __init__(self, infra):
+        self.infra = infra
+
+    def delete_by_doc_hash(self, doc_hash):
+        self.infra.deleted = doc_hash
+        return [1]
+
+
 class _Infra:
     ready = SimpleNamespace(
         milvus="connected",
@@ -52,12 +67,12 @@ class _Infra:
         kafka="disconnected",
     )
 
-    def list_snapshots(self, limit=50):
-        return []
-
-    def delete_rag_chunks_by_doc_hash(self, doc_hash):
-        self.deleted = doc_hash
-        return [1]
+    def __init__(self):
+        self.deleted = ""
+        self.repo = SimpleNamespace(
+            snapshot=_SnapshotRepo(),
+            ragchunk=_RagchunkRepo(self),
+        )
 
 
 def _client():
@@ -158,3 +173,61 @@ def test_chat_stream_emits_sse_events_for_main_frontend():
     assert "event: route" in body
     assert "event: token" in body
     assert "event: done" in body
+
+
+def test_legacy_rag_query_route_removed_to_match_main_branch():
+    status, _payload = _request(
+        _client(),
+        "POST",
+        "/api/rag/query",
+        json.dumps({"question": "old route"}).encode(),
+    )
+
+    assert status in {404, 405}
+
+
+def test_frontend_contains_local_document_library_ui():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "libraryDocList" in html
+    assert "docViewer" in html
+    assert "loadLibraryDocs" in html
+    assert "fetchDocumentJSON('/api/documents')" in html
+    assert "/api/documents/' + encodeURIComponent(id) + '/ingest" in html
+    assert "function escAttr" in html
+
+
+def test_frontend_refreshes_library_after_document_tool_events():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "function maybeRefreshLibraryAfterTool" in html
+    assert "write_document" in html
+    assert "ingest_document" in html
+    assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name)" in html
+    assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name || (data.task && data.task.tool_name))" in html
+
+
+def test_frontend_restores_upload_list_from_document_library():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "localStorage.removeItem('ai_docs')" not in html
+    assert "syncUploadedDocsFromLibrary" in html
+    assert "d.source === 'user_upload'" in html
+
+
+def test_frontend_does_not_show_document_version_as_chunk_count():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "chunks: Number(d.latest_version || 0)" not in html
+    assert "indexed: Number(d.latest_version || 0)" not in html
+    assert "d.persisted" in html
+    assert "v${d.version || 0}" in html
+
+
+def test_frontend_overwrites_stale_upload_cache_from_document_library():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "const uploadKey" in html
+    assert "const existingKey" in html
+    assert "byKey.set(uploadKey, d)" in html
+    assert "byName.has(d.name)" not in html

@@ -18,6 +18,11 @@ def test_topological_levels_group_independent_nodes():
     assert graph.topological_levels() == [["n1", "n2"], ["n3"]]
 
 
+def test_node_type_includes_main_alignment_values():
+    assert NodeType.THINK.value == "think"
+    assert NodeType.AGGREGATE.value == "aggregate"
+
+
 def test_validate_rejects_missing_dependency():
     graph = TaskGraph([
         Node(id="n1", type=NodeType.TOOL, tool_name="search", depends_on=["missing"]),

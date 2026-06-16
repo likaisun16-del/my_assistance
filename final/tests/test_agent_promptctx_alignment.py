@@ -8,18 +8,28 @@ from internal.promptctx import TaskMemBuffer, ToolStateTracker
 from internal.tools.tools import Tool, ToolExecutor
 
 
-class _Infra:
-    def load_preferences(self, _user_id):
+class _PrefRepo:
+    def load(self, _user_id):
         return {"city": "上海"}
 
-    def load_long_term_items(self):
-        return []
-
-    def save_preference(self, *_args):
+    def save(self, *_args):
         pass
 
-    def save_long_term_item(self, *_args):
+
+class _LtmRepo:
+    def load(self):
+        return []
+
+    def save(self, *_args):
         return 1
+
+
+class _Infra:
+    def __init__(self):
+        self.repo = SimpleNamespace(
+            preference=_PrefRepo(),
+            ltm=_LtmRepo(),
+        )
 
 
 class _Cfg:
@@ -47,7 +57,7 @@ def _agent_shell():
     agent.llm = _LLM()
     agent.stm = ShortTerm(5)
     agent.ltm = LongTerm(agent.cfg, agent.inf)
-    agent.ltm.items = [Item(content="用户喜欢中文回答", importance=0.9)]
+    agent.ltm.items = [Item(content="用户喜欢中文回答", importance=0.9, category="preference")]
     agent.preference = Preference("u", agent.inf)
     agent.tool_executor = ToolExecutor([
         Tool(name="search_web", description="搜索", params=[{"name": "query", "type": "string"}], func=lambda p: "web"),

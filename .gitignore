@@ -1,2 +1,3 @@
 # local staging area for spinning out video-factory into its own repo
 _vf-staging/
+final/config/config.local.yaml
