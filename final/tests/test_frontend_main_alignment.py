@@ -194,3 +194,13 @@ def test_frontend_contains_local_document_library_ui():
     assert "loadLibraryDocs" in html
     assert "fetchDocumentJSON('/api/documents')" in html
     assert "/api/documents/' + encodeURIComponent(id) + '/ingest" in html
+
+
+def test_frontend_refreshes_library_after_document_tool_events():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "function maybeRefreshLibraryAfterTool" in html
+    assert "write_document" in html
+    assert "ingest_document" in html
+    assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name)" in html
+    assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name || (data.task && data.task.tool_name))" in html

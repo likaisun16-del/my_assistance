@@ -1243,6 +1243,14 @@ async function ingestDocumentByID(id) {
   return res;
 }
 
+function maybeRefreshLibraryAfterTool(toolName) {
+  if (!toolName) return;
+  const name = String(toolName);
+  if (['write_document', 'ingest_document', 'doc_agent'].some(t => name.includes(t))) {
+    loadLibraryDocs();
+  }
+}
+
 function openDocumentViewer(doc, ver) {
   currentViewerDocId = doc.id || null;
   const viewer = document.getElementById('docViewer');
@@ -1686,6 +1694,7 @@ async function send() {
                 <span class="step-type ${cls}">${label}</span>
                 <div class="step-content">${escHtml(data.content || '')}${paramsHtml}</div>
               </div>`;
+            maybeRefreshLibraryAfterTool(data.tool || data.tool_name);
             break;
           }
           case 'tool_call': {
@@ -1696,6 +1705,7 @@ async function send() {
               <div class="tool-call-row"><span class="tool-call-label">结果</span><span class="tool-call-val tool-call-result">${escHtml(data.tool_result || '')}</span></div>
             </div>`;
             toolCallEl.style.display = '';
+            maybeRefreshLibraryAfterTool(data.tool || data.tool_name);
             break;
           }
           case 'rag_result': {
@@ -1728,6 +1738,7 @@ async function send() {
             if (data.interrupted) {
               answerEl.innerHTML = `<div class="interrupted-badge">✦ 已中断</div>` + answerEl.innerHTML;
             }
+            maybeRefreshLibraryAfterTool(data.tool || data.tool_name || (data.task && data.task.tool_name));
             break;
           }
         }
