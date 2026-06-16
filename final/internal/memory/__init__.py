@@ -1,1 +1,2 @@
-from .memory import ShortTerm, LongTerm, Preference, Item
+from .memory import ShortTerm, LongTerm, Item
+from .preference import Preference

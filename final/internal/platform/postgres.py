@@ -40,14 +40,20 @@ _DDLS: List[str] = [
         content       TEXT NOT NULL,
         importance    FLOAT NOT NULL DEFAULT 0.5,
         embedding     JSONB,
-        created_at    TIMESTAMP DEFAULT NOW(),
-        last_accessed TIMESTAMP DEFAULT NOW()
+        created_at    DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+        last_accessed DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW()),
+        category      VARCHAR(64) NOT NULL DEFAULT '',
+        tags          JSONB NOT NULL DEFAULT '[]'::jsonb,
+        slot_hint     VARCHAR(64) NOT NULL DEFAULT '',
+        score         DOUBLE PRECISION NOT NULL DEFAULT 0.0
     )""",
-    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMP DEFAULT NOW()",
-    # Schema-driven 装配支持：分类 / 标签 / 槽位提示
-    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS category  TEXT NOT NULL DEFAULT 'general'",
-    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags      TEXT[] NOT NULL DEFAULT '{}'",
-    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint TEXT",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS created_at    DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS last_accessed DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())",
+    # Schema-driven 装配支持：分类 / 标签 / 槽位提示 / 召回分
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS category      VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags          JSONB NOT NULL DEFAULT '[]'::jsonb",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint     VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS score         DOUBLE PRECISION NOT NULL DEFAULT 0.0",
     "CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)",
     "CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)",
     """CREATE TABLE IF NOT EXISTS rag_chunks (
