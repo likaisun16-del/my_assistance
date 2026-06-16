@@ -67,6 +67,22 @@ def test_upload_returns_parser_metadata_and_document_fields():
     assert data["version"]["id"] == "ver_1"
 
 
+def test_upload_strips_nul_before_writing_document():
+    agent = DocumentAPIAgent()
+    app = _client(agent)
+
+    status, _payload = _request(
+        app,
+        "POST",
+        "/api/upload",
+        json.dumps({"content": "简历\x00内容"}).encode(),
+    )
+
+    assert status == 200
+    assert "\x00" not in agent.written["content_md"]
+    assert "简历" in agent.written["content_md"]
+
+
 class DocumentAPIAgent:
     def __init__(self):
         self.doc = Document(

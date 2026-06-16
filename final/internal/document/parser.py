@@ -145,6 +145,7 @@ def _decode_text(data: bytes) -> str:
 
 def _normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\x00", "")
     text = _HYPHEN_LINE_BREAK_RE.sub(r"\1\2", text)
     lines = [line.rstrip() for line in text.split("\n")]
     normalized = "\n".join(lines)
