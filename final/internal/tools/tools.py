@@ -133,16 +133,6 @@ def search_web(args: Dict[str, Any]) -> str:
     return _mock_search(args.get("query", "") if isinstance(args, dict) else "")
 
 
-def rag_search(args: Dict[str, Any]) -> str:
-    """占位实现：Agent 在启动期会用真实闭包覆盖。
-
-    保留同名函数仅为兼容旧调用路径（直接 import 的测试代码）；
-    生产路径下 default_tools() 不再注册它，由 Agent._register_builtin_tools 注入。
-    """
-    query = args.get("query", "") if isinstance(args, dict) else ""
-    return f"知识库未就绪：'{query}'（请通过 Agent 注入真实 rag_search 闭包）"
-
-
 # ─────────────────────────────── tavily / exec_command 工具 ──────────────────
 
 def build_tavily_tool(cfg=None) -> Tool:

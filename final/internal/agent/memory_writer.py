@@ -4,7 +4,6 @@
 #   - extract_memory_from_reply：从 assistant 回复抽取 k-v 事实
 #   - classify_memory_content：基于关键字的快速分类规则
 #   - llm_classify_memory：LLM 兜底分类
-#   - sync_consolidation_to_db：把记忆合并结果同步回 PG
 #
 # Python 在 Go 的 goroutine + channel 基础上额外提供 AsyncMemoryWriter：
 # 后台线程 + queue.Queue 串行化所有记忆写入，避免 PG/Milvus 并发竞争。
@@ -162,25 +161,6 @@ def llm_classify_memory(agent, content: str) -> Tuple[str, List[str], str]:
         return "general", [], ""
     cat = result.get("category") or "general"
     return cat, list(result.get("tags") or []), result.get("slot_hint") or ""
-
-
-def sync_consolidation_to_db(agent, result: Any):
-    """将记忆合并结果同步到 PostgreSQL（best-effort）。
-
-    Python 端 LongTerm.consolidate() 直接修改 self.items（无 result 返回值），
-    本函数保留为 Go 版 API 对齐占位，仅在传入 dict-like result 时落库。
-    """
-    if not result:
-        return
-    try:
-        delete_ids = result.get("delete_from_db") if isinstance(result, dict) else None
-        if delete_ids:
-            logger.info("🧹 记忆合并：删除 %d 条 id", len(delete_ids))
-        update_items = result.get("update_in_db") if isinstance(result, dict) else None
-        if update_items:
-            logger.info("🔗 记忆合并：更新 %d 条", len(update_items))
-    except Exception as e:
-        logger.warning("⚠️  sync_consolidation_to_db 失败: %s", e)
 
 
 # ── ReAct 模式下的同步 + 异步偏好提取（保留原 agent.py 的实现）──────────────
