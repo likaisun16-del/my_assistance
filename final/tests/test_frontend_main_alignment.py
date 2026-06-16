@@ -204,3 +204,11 @@ def test_frontend_refreshes_library_after_document_tool_events():
     assert "ingest_document" in html
     assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name)" in html
     assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name || (data.task && data.task.tool_name))" in html
+
+
+def test_frontend_restores_upload_list_from_document_library():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "localStorage.removeItem('ai_docs')" not in html
+    assert "syncUploadedDocsFromLibrary" in html
+    assert "d.source === 'user_upload'" in html

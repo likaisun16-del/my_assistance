@@ -993,10 +993,9 @@ let selectedTools = [];
 let availableTools = [];
 let sessions = JSON.parse(localStorage.getItem('ai_sessions') || '[]');
 let currentId = null;
-let uploadedDocs = [];
+let uploadedDocs = JSON.parse(localStorage.getItem('ai_docs') || '[]');
 let libraryDocs = [];
 let currentViewerDocId = null;
-localStorage.removeItem('ai_docs');
 let isLoading = false;
 
 // ══════════════════════════════════════════
@@ -1174,10 +1173,35 @@ async function loadLibraryDocs(e) {
   try {
     const res = await fetchDocumentJSON('/api/documents');
     libraryDocs = res.documents || [];
+    syncUploadedDocsFromLibrary();
   } catch(e) {
     libraryDocs = [];
   }
+  renderDocs();
   renderLibraryDocs();
+}
+
+function syncUploadedDocsFromLibrary() {
+  const uploads = libraryDocs
+    .filter(d => d && d.source === 'user_upload')
+    .map(d => ({
+      name: d.title || d.id || '上传文档',
+      chunks: Number(d.latest_version || 0),
+      indexed: Number(d.latest_version || 0),
+      parser: '',
+      pages: 0,
+      textChars: 0,
+      needsOCR: false,
+      docHash: '',
+      ts: Date.parse(d.updated_at || d.created_at || '') || Date.now(),
+    }));
+  const byName = new Map();
+  for (const d of [...uploads, ...uploadedDocs]) {
+    if (!d || !d.name || byName.has(d.name)) continue;
+    byName.set(d.name, d);
+  }
+  uploadedDocs = Array.from(byName.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  localStorage.setItem('ai_docs', JSON.stringify(uploadedDocs));
 }
 
 function renderLibraryDocs() {
