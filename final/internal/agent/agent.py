@@ -15,10 +15,13 @@ import logging
 import re
 import threading
 import time
+from dataclasses import asdict
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from config.config import APIConfig
+from internal.document.library import DOCUMENT_SOURCE_AGENT, WriteRequest
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient, Message
 from internal.memory.memory import LongTerm, Preference, ShortTerm
@@ -282,6 +285,122 @@ class UnifiedAgent:
             params=[{"name": "query", "type": "string", "description": "检索关键词或问题"}],
             func=_rag_search,
         ))
+        self._register_document_tools()
+
+    def _register_document_tools(self) -> None:
+        for tool in [
+            self._write_document_tool(),
+            self._list_documents_tool(),
+            self._read_document_tool(),
+            self._ingest_document_tool(),
+        ]:
+            self.tool_executor.add_tool(tool)
+
+    def _write_document_tool(self) -> Tool:
+        return Tool(
+            name="write_document",
+            description="将 Markdown 文档写入本地文档库，可选择同步入库 RAG。适合保存报告、总结、研究结果。",
+            params=[
+                {"name": "title", "type": "string", "description": "文档标题"},
+                {"name": "content_md", "type": "string", "description": "Markdown 正文"},
+                {"name": "doc_type", "type": "string", "description": "文档类型，如 report/note/summary"},
+                {"name": "source", "type": "string", "description": "来源，如 agent_generated"},
+                {"name": "summary", "type": "string", "description": "简短摘要"},
+                {"name": "ingest_to_rag", "type": "boolean", "description": "是否写入后立即进入 RAG 索引"},
+            ],
+            func=lambda params: _json_string(self.write_document(
+                WriteRequest(
+                    title=_param_string(params, "title"),
+                    doc_type=_param_string_default(params, "doc_type", "report"),
+                    source=_param_string_default(params, "source", DOCUMENT_SOURCE_AGENT),
+                    created_by="agent",
+                    content_md=_param_string(params, "content_md") or _param_string(params, "content"),
+                    summary=_param_string(params, "summary"),
+                    metadata={"tool": "write_document"},
+                ),
+                _param_bool(params, "ingest_to_rag"),
+            )),
+        )
+
+    def _list_documents_tool(self) -> Tool:
+        return Tool(
+            name="list_documents",
+            description="列出本地文档库中的文档。",
+            params=[],
+            func=lambda params: _json_string({"documents": self.list_documents()}),
+        )
+
+    def _read_document_tool(self) -> Tool:
+        return Tool(
+            name="read_document",
+            description="读取本地文档库中的指定文档最新版本。",
+            params=[{"name": "document_id", "type": "string", "description": "文档 ID"}],
+            func=lambda params: _json_string(self.get_document(_param_string(params, "document_id"))),
+        )
+
+    def _ingest_document_tool(self) -> Tool:
+        return Tool(
+            name="ingest_document",
+            description="将本地文档库中的文档版本切分并写入 RAG 索引。",
+            params=[
+                {"name": "document_id", "type": "string", "description": "文档 ID"},
+                {"name": "version_id", "type": "string", "description": "版本 ID，不填则使用最新版本"},
+            ],
+            func=lambda params: _json_string(self.ingest_document(
+                _param_string(params, "document_id"),
+                _param_string(params, "version_id"),
+            )),
+        )
+
+    def _document_store(self):
+        store = getattr(getattr(getattr(self, "inf", None), "repo", None), "documents", None)
+        if store is None:
+            raise RuntimeError("document library not configured")
+        return store
+
+    def write_document(self, req: WriteRequest, ingest_to_rag: bool = False) -> Dict[str, Any]:
+        wr = self._document_store().write(req)
+        out = _to_jsonable(wr)
+        if ingest_to_rag:
+            out["ingest"] = self._ingest_content(
+                wr.version.content_md,
+                document_id=wr.document.id,
+                version_id=wr.version.id,
+                section=wr.document.doc_type,
+            )
+        return out
+
+    def list_documents(self) -> List[Any]:
+        return self._document_store().list()
+
+    def get_document(self, document_id: str) -> Dict[str, Any]:
+        doc, ver = self._document_store().get(document_id)
+        return {"document": doc, "version": ver}
+
+    def ingest_document(self, document_id: str, version_id: str = "") -> Dict[str, Any]:
+        store = self._document_store()
+        if version_id:
+            ver = store.get_version(version_id)
+        else:
+            _, ver = store.get(document_id)
+        doc_id = document_id or ver.document_id
+        return self._ingest_content(
+            ver.content_md,
+            document_id=doc_id,
+            version_id=ver.id,
+            section="document",
+        )
+
+    def _ingest_content(self, content: str, document_id: str, version_id: str, section: str) -> Dict[str, Any]:
+        if self.rag is None:
+            raise RuntimeError("RAG 引擎未初始化")
+        chunk_count = self.rag.ingest(content)
+        return {
+            "chunk_count": int(chunk_count or 0),
+            "document_id": document_id,
+            "version_id": version_id,
+            "section": section,
+        }
 
     def register_mcp_tool(self, name: str, description: str, params: List[Dict[str, str]], func):
         self.add_tool(new_mcp_tool(name, description, params, func))
@@ -698,3 +817,46 @@ class UnifiedAgent:
             self.memory_writer.stop()
         except Exception:
             pass
+
+
+def _param_string(params: Dict[str, Any], key: str) -> str:
+    if not isinstance(params, dict):
+        return ""
+    value = params.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _param_string_default(params: Dict[str, Any], key: str, fallback: str) -> str:
+    value = _param_string(params, key)
+    return value if value else fallback
+
+
+def _param_bool(params: Dict[str, Any], key: str) -> bool:
+    if not isinstance(params, dict):
+        return False
+    value = params.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "on"}
+    return bool(value)
+
+
+def _json_string(value: Any) -> str:
+    return json.dumps(_to_jsonable(value), ensure_ascii=False, indent=2)
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if hasattr(value, "__dataclass_fields__"):
+        return _to_jsonable(asdict(value))
+    return value
