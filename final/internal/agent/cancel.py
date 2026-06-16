@@ -10,7 +10,7 @@
 import logging
 import threading
 import traceback
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,9 @@ class CancelRegistry:
         self._next_id = 0
         # 当前正在执行的 task 状态（仅保留一个引用，用于 PlannerSource 读取）
         self._current_task: Optional[dict] = None
+        # 当前任务的步骤快照列表（与 main taskRuntime.snapshots 对齐）。
+        # set_task 时清空，append_snapshot 持锁追加，snapshot_list 返回拷贝。
+        self._snapshots: List[dict] = []
 
     def register(self) -> tuple:
         """注册一个新的 CancelToken，返回 (token, unregister)。"""
@@ -69,9 +72,22 @@ class CancelRegistry:
             return self._current_task
 
     def set_task(self, task: Optional[dict]):
-        """设置当前 task，对应 Go setTask。"""
+        """设置当前 task，并清空 snapshots（对应 Go setTask 语义）。"""
         with self._lock:
             self._current_task = task
+            self._snapshots = []
+
+    def append_snapshot(self, snapshot: dict) -> None:
+        """持锁追加一条步骤快照（对应 Go appendSnapshot）。"""
+        if snapshot is None:
+            return
+        with self._lock:
+            self._snapshots.append(snapshot)
+
+    def snapshot_list(self) -> List[dict]:
+        """返回当前任务的快照拷贝（对应 Go snapshotList）。"""
+        with self._lock:
+            return list(self._snapshots)
 
 
 def go_safe(name: str, fn: Callable[[], None]) -> threading.Thread:

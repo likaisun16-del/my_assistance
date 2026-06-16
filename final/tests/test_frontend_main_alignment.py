@@ -44,6 +44,20 @@ class _Agent:
         return "知识库回答:" + question, [{"content": "片段", "score": 0.8, "source": "test"}]
 
 
+class _SnapshotRepo:
+    def list(self, limit=50):
+        return []
+
+
+class _RagchunkRepo:
+    def __init__(self, infra):
+        self.infra = infra
+
+    def delete_by_doc_hash(self, doc_hash):
+        self.infra.deleted = doc_hash
+        return [1]
+
+
 class _Infra:
     ready = SimpleNamespace(
         milvus="connected",
@@ -52,12 +66,12 @@ class _Infra:
         kafka="disconnected",
     )
 
-    def list_snapshots(self, limit=50):
-        return []
-
-    def delete_rag_chunks_by_doc_hash(self, doc_hash):
-        self.deleted = doc_hash
-        return [1]
+    def __init__(self):
+        self.deleted = ""
+        self.repo = SimpleNamespace(
+            snapshot=_SnapshotRepo(),
+            ragchunk=_RagchunkRepo(self),
+        )
 
 
 def _client():

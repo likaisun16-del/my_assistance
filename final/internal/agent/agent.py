@@ -9,9 +9,7 @@
 #   - memory_writer.py   — 异步记忆写入 + 回复事实抽取
 #   - status.py          — 系统状态视图聚合
 #
-# 本文件只负责：构造 + 路由分派 + ReAct 推理循环（保留原 _generate_thought /
-# _parse_action / _call_tool_with_retry / _async_update_memory 实现作为 react
-# 分支的内部细节）。
+# 本文件只负责：构造 + 路由分派 + 图调度入口（react 模式走 GraphRuntime）。
 import json
 import logging
 import re
@@ -24,6 +22,7 @@ from config.config import APIConfig
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient, Message
 from internal.memory.memory import LongTerm, Preference, ShortTerm
+from internal.memory.mem_stack import ConsolidationConfig, MemoryStack
 from internal.promptctx import (
     ConstraintsSource,
     ContextAssembler,
@@ -112,6 +111,17 @@ class UnifiedAgent:
         self.stm = ShortTerm(cfg.short_term_max_turns)
         self.ltm = LongTerm(cfg, inf)
         self.preference = Preference("default_user", inf)
+        # 三层记忆 + 偏好聚合容器（与 main memoryStack 对齐）。
+        # graph_memory 由 init_knowledge_graph 在末尾通过 attach_graph 注入。
+        self.mem = MemoryStack(stm=self.stm, ltm=self.ltm, preference=self.preference)
+        # 用 ConsolidationConfig（dataclass + memory_consolidation_* 别名）替换裸 cfg
+        # 喂给 LongTerm；保留对 APIConfig 的引用便于后续访问其它字段。
+        try:
+            self.ltm.set_consolidation_config(ConsolidationConfig.from_api_config(cfg))
+        except Exception as e:
+            logger.warning("⚠️  ConsolidationConfig 装配失败: %s", e)
+        # 暴露 chat_history 仓储，供 restore.py 与 _save_chat_history 复用。
+        self.chat_repo = getattr(getattr(inf, "repo", None), "chat_history", None)
 
         # RAG 引擎构造失败不致命：降级为禁用知识库
         try:
@@ -127,9 +137,6 @@ class UnifiedAgent:
         # registerBuiltinTools 对齐）。search_web 已在 default_tools 中
         # 通过 search_web_factory 处理 Tavily / LLM 降级，无需重复注册。
         self._register_builtin_tools()
-
-        self.max_iterations = cfg.max_iterations
-        self.max_retries = cfg.max_retries
 
         # 取消令牌注册表 + 兼容旧接口的 process-level cancel event
         self._cancel_registry = CancelRegistry()
@@ -154,33 +161,28 @@ class UnifiedAgent:
                 logger.warning("⚠️  RAG generate 函数注入失败: %s", e)
 
         # 加载持久化的长期记忆 + chat_history（best-effort）
-        try:
-            self.ltm.load_from_storage()
-        except Exception as e:
-            logger.warning("⚠️  长期记忆加载失败: %s", e)
+        # 注：实际还原由 restore_from_db 完成，此处的 ltm.load_from_storage
+        # 仅作为冷启动 RAG 索引装载前的快速预热——已合并到 _bootstrap_concurrent。
 
-        # 沙箱：失败降级 None
+        # bootstrap 4 路并发（与 main bootstrapConcurrent 对齐）：
+        #   - ragchunk.init(dim)         建 Milvus collection + ES 索引
+        #   - restore_from_db            从 PG 恢复偏好 / LTM / 聊天记录
+        #   - restore_rag_from_db        从 PG 恢复 RAG chunks
+        #   - init_sandbox               Docker 探测 + exec_command 注册
+        # 主线程同时同步注册 builtin 工具（rag_search 已在 _register_builtin_tools
+        # 中提前完成，无须再放进并发组）。
         self.sandbox = None
-        try:
-            init_sandbox(self)
-        except Exception as e:
-            logger.warning("⚠️  init_sandbox 失败: %s", e)
-            self.sandbox = None
+        self._bootstrap_concurrent()
 
-        # 知识图谱：失败降级 None
+        # 知识图谱：必须在 restore_from_db 完成后串行执行（依赖 ltm 已就绪）
         self.kg = None
         try:
             init_knowledge_graph(self)
         except Exception as e:
             logger.warning("⚠️  init_knowledge_graph 失败: %s", e)
             self.kg = None
-
-        # 启动期恢复偏好/长期记忆/聊天记录 + RAG chunks（best-effort）
-        try:
-            restore_from_db(self)
-            restore_rag_from_db(self)
-        except Exception as e:
-            logger.warning("⚠️  启动期恢复失败: %s", e)
+        # KG 就绪后把 graph_memory 挂回 mem stack（对应 main attachGraph）
+        self.mem.attach_graph(getattr(self, "graph_memory", None))
 
         # 快照计数器（每 N 轮序列化 agent_state 到 PG）
         self._turn_count = 0
@@ -188,6 +190,49 @@ class UnifiedAgent:
         self._build_prompt_context()
 
         logger.info("✅ UnifiedAgent 初始化完成")
+
+    def _bootstrap_concurrent(self) -> None:
+        """与 main bootstrapConcurrent 对齐的 4 路并发启动。
+
+        每个子任务自行做异常吞没，整体串行总耗时被压缩到最慢一项。
+        """
+        def _ragchunk_init():
+            try:
+                repo = getattr(getattr(self.inf, "repo", None), "ragchunk", None)
+                if repo is not None and hasattr(repo, "init"):
+                    repo.init(int(self.cfg.rag_milvus_dim or 1024))
+            except Exception as e:
+                logger.warning("⚠️  ragchunk.init 失败: %s", e)
+
+        def _restore_db():
+            try:
+                restore_from_db(self)
+            except Exception as e:
+                logger.warning("⚠️  restore_from_db 失败: %s", e)
+
+        def _restore_rag():
+            try:
+                restore_rag_from_db(self)
+            except Exception as e:
+                logger.warning("⚠️  restore_rag_from_db 失败: %s", e)
+
+        def _init_sandbox():
+            try:
+                init_sandbox(self)
+            except Exception as e:
+                logger.warning("⚠️  init_sandbox 失败: %s", e)
+                self.sandbox = None
+
+        threads = [
+            threading.Thread(target=_ragchunk_init, name="bootstrap:ragchunk", daemon=True),
+            threading.Thread(target=_restore_db, name="bootstrap:restore-db", daemon=True),
+            threading.Thread(target=_restore_rag, name="bootstrap:restore-rag", daemon=True),
+            threading.Thread(target=_init_sandbox, name="bootstrap:sandbox", daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     # ── 对外 API ────────────────────────────────────────────────────────────
 
@@ -260,71 +305,101 @@ class UnifiedAgent:
     # ── 调度主循环 ─────────────────────────────────────────────────────────
 
     def _dispatch(self, query: str, opts: ChatOptions, token) -> Response:
-        resp = Response(query=query)
-        self.stm.add("user", query)
-        self._save_chat_history("user", query)
-
-        # 偏好/记忆抽取（同步规则 + 异步 LLM）
-        async_update_memory(self, query, resp)
-
-        mem_prefix = self._build_memory_system_prefix(query)
-        hist_msgs = self._build_history_messages(query)
+        """三段式编排：prepare → dispatch → finalize（与 main runOnce 对齐）。"""
+        pr = self._prepare(query, opts)
+        resp = Response(query=query, mode=pr["mode"])
 
         if token.is_cancelled():
             resp.interrupted = True
             resp.answer = "[已中断] 请求在开始前被取消"
             return resp
 
-        rag_loaded = bool(self.rag and getattr(self.rag, "loaded", False))
-
-        # ── 路由 ───────────────────────────────────────────────────────────
-        if opts.explicit:
-            if opts.selected_tools:
-                filtered = self._filter_tools(opts.selected_tools)
-                if need_react_from_tools(query, filtered):
-                    resp.mode = "react"
-                    resp.answer, resp.steps, resp.task = self._run_react_with_tools(
-                        query, filtered, mem_prefix, hist_msgs, token
-                    )
-                else:
-                    resp.mode = "tool"
-                    resp.answer, resp.tool_call = self._run_tool_from_set(
-                        query, filtered, mem_prefix, hist_msgs
-                    )
-            elif opts.use_rag and rag_loaded:
-                resp.mode = "rag"
-                resp.answer, resp.search_results = self._run_rag_query(query)
-            else:
-                resp.mode = "chat"
-                resp.answer = self._chat_response(mem_prefix, hist_msgs)
-        else:
-            if need_react(query):
-                resp.mode = "react"
-                resp.answer, resp.steps, resp.task = self._run_react_with_tools(
-                    query, self.tool_executor._tool_map, mem_prefix, hist_msgs, token
-                )
-            elif need_tool(query):
-                resp.mode = "tool"
-                resp.answer, resp.tool_call = self._run_tool_from_set(
-                    query, self.tool_executor._tool_map, mem_prefix, hist_msgs
-                )
-            elif need_rag(query, rag_loaded):
-                resp.mode = "rag"
-                resp.answer, resp.search_results = self._run_rag_query(query)
-            else:
-                resp.mode = "chat"
-                resp.answer = self._chat_response(mem_prefix, hist_msgs)
+        self._dispatch_mode(pr, resp, token)
 
         if token.is_cancelled():
             resp.interrupted = True
 
-        # 写回短期记忆与持久化
+        self._finalize(query, resp)
+        return resp
+
+    # ── prepare ──────────────────────────────────────────────────────────────
+
+    def _prepare(self, query: str, opts: ChatOptions) -> Dict[str, Any]:
+        """STM 写入 + 偏好提取 + 路由决策 + 上下文装配 + 历史构建。"""
+        self.stm.add("user", query)
+        self._save_chat_history("user", query)
+
+        # 偏好/记忆抽取（同步规则即时回显 + 异步 LLM 扩展）
+        # 注：async_update_memory 的写入路径直接修改 resp.extracted_info，
+        # 这里复用一个 Response 占位以承接同步部分的输出。
+        ph = Response(query=query)
+        async_update_memory(self, query, ph)
+
+        rag_loaded = bool(self.rag and getattr(self.rag, "loaded", False))
+        if opts.explicit:
+            if opts.selected_tools:
+                route_tools = self._filter_tools(opts.selected_tools)
+                mode = "react" if need_react_from_tools(query, route_tools) else "tool"
+            elif opts.use_rag and rag_loaded:
+                mode, route_tools = "rag", None
+            else:
+                mode, route_tools = "chat", None
+        else:
+            if need_react(query):
+                mode, route_tools = "react", self.tool_executor.snapshot()
+            elif need_tool(query):
+                mode, route_tools = "tool", self.tool_executor.snapshot()
+            elif need_rag(query, rag_loaded):
+                mode, route_tools = "rag", None
+            else:
+                mode, route_tools = "chat", None
+
+        mem_prefix = self._build_memory_system_prefix(query)
+        hist_msgs = self._build_history_messages(query)
+
+        return {
+            "query": query,
+            "mode": mode,
+            "route_tools": route_tools,
+            "mem_prefix": mem_prefix,
+            "hist_msgs": hist_msgs,
+            "extracted": ph.extracted_info,
+        }
+
+    # ── dispatch ─────────────────────────────────────────────────────────────
+
+    def _dispatch_mode(self, pr: Dict[str, Any], resp: Response, token) -> None:
+        """按 mode 分发到对应 handler，把结果填回 resp。"""
+        mode = pr["mode"]
+        query = pr["query"]
+        mem_prefix = pr["mem_prefix"]
+        hist_msgs = pr["hist_msgs"]
+        route_tools = pr["route_tools"]
+        resp.extracted_info = pr["extracted"]
+
+        if mode == "react":
+            resp.answer, resp.steps, resp.task = self._run_react_with_tools(
+                query, route_tools, mem_prefix, hist_msgs, token
+            )
+        elif mode == "tool":
+            resp.answer, resp.tool_call = self._run_tool_from_set(
+                query, route_tools, mem_prefix, hist_msgs
+            )
+        elif mode == "rag":
+            resp.answer, resp.search_results = self._run_rag_query(query)
+        else:
+            resp.answer = self._chat_response(mem_prefix, hist_msgs)
+
+    # ── finalize ─────────────────────────────────────────────────────────────
+
+    def _finalize(self, query: str, resp: Response) -> None:
+        """assistant 写回 + 异步记忆抽取 + 异步图感知合并 + 事件发布 + 计数。"""
         self.stm.add("assistant", resp.answer)
         self._save_chat_history("assistant", resp.answer)
 
         # 异步：从回复中提取事实 → 长期记忆
         self.memory_writer.submit(lambda: extract_memory_from_reply(self, resp.answer))
-        # 异步：长期记忆合并/淘汰
+        # 异步：长期记忆合并/淘汰（有图层时走图感知合并）
         self.memory_writer.submit(lambda: maybe_consolidate_memory(self))
 
         # 每 N 轮快照一次 agent 状态到 PG
@@ -333,7 +408,7 @@ class UnifiedAgent:
             go_safe("snapshot", lambda: self._save_agent_snapshot(query, resp))
 
         try:
-            self.inf.publish_event(
+            self.inf.repo.events.publish(
                 "agent.chat",
                 json.dumps({"query": query, "mode": resp.mode}, ensure_ascii=False),
             )
@@ -343,7 +418,6 @@ class UnifiedAgent:
         resp.short_term_count = self.stm.count()
         resp.long_term_count = len(self.ltm.items)
         resp.preferences = self.preference.get_all()
-        return resp
 
     # ── Memory / Prompt 拼装 ───────────────────────────────────────────────
 
@@ -357,7 +431,7 @@ class UnifiedAgent:
         registry.register(ProfileSource(self.preference, self.ltm))
         registry.register(PlannerSource(self._planner_snapshot))
         registry.register(TaskMemSource(self.task_mem))
-        registry.register(ToolStateSource(lambda: self.tool_executor._tool_map, self.tool_tracker))
+        registry.register(ToolStateSource(lambda: self.tool_executor.snapshot(), self.tool_tracker))
         registry.register(ConstraintsSource([
             Policy(pattern="rm -rf", reason="禁止破坏性删除命令", level="block"),
             Policy(pattern="sudo", reason="禁止提权命令", level="block"),
@@ -399,24 +473,26 @@ class UnifiedAgent:
 
     def save_snapshot(self, task: dict) -> None:
         task_id = task.get("task_id", f"task_{int(time.time())}") if isinstance(task, dict) else f"task_{int(time.time())}"
+        # 持锁追加到 cancel registry（与 main taskRuntime.appendSnapshot 对齐）
+        if isinstance(task, dict):
+            self._cancel_registry.append_snapshot(dict(task))
         try:
-            self.inf.save_snapshot(task_id, json.dumps(task, ensure_ascii=False))
+            self.inf.repo.snapshot.save(task_id, json.dumps(task, ensure_ascii=False))
         except Exception as e:
             logger.warning("⚠️  快照写入失败: %s", e)
 
+    def snapshot_list(self) -> List[dict]:
+        """返回当前任务的内存快照列表（对应 main snapshotList）。"""
+        return self._cancel_registry.snapshot_list()
+
     def _save_chat_history(self, role: str, content: str) -> None:
-        """best-effort 写聊天记录。优先 chat_repo，其次 inf.save_chat_history。"""
+        """best-effort 写聊天记录。优先 chat_repo，其次 inf.repo.chat_history。"""
         chat_repo = getattr(self, "chat_repo", None)
+        if chat_repo is None:
+            chat_repo = getattr(getattr(self.inf, "repo", None), "chat_history", None)
         if chat_repo is not None and hasattr(chat_repo, "save"):
             try:
                 chat_repo.save(role, content)
-                return
-            except Exception:
-                pass
-        save_fn = getattr(self.inf, "save_chat_history", None)
-        if callable(save_fn):
-            try:
-                save_fn(role, content)
             except Exception:
                 pass
 
@@ -455,7 +531,7 @@ class UnifiedAgent:
     # ── 工具调用（tool 模式） ──────────────────────────────────────────────
 
     def _filter_tools(self, names: List[str]) -> Dict[str, Tool]:
-        return {n: self.tool_executor._tool_map[n] for n in names if n in self.tool_executor._tool_map}
+        return self.tool_executor.filter_tools(names)
 
     def _parse_tool_params(self, tool_name: str, user_input: str) -> Dict[str, str]:
         params: Dict[str, str] = {}
@@ -471,11 +547,45 @@ class UnifiedAgent:
                 params["query"] = user_input
         return params
 
+    # 偏好键 → 候选工具参数名（与 main 分支 fillParamsFromPreference 完全一致）
+    _PREFERENCE_PARAM_MAP = {
+        "城市": ("city", "location", "location_name"),
+        "时区": ("timezone", "tz", "time_zone"),
+        "姓名": ("name", "username", "user_name"),
+        "语言": ("language", "lang"),
+        "国家": ("country", "nation"),
+    }
+
+    def _fill_params_from_preference(self, params: Dict[str, Any]) -> None:
+        """在工具 Execute 之前用偏好补齐空槽位（不覆盖既有非空值）。
+
+        与 main 分支 UnifiedAgent.fillParamsFromPreference 对齐：取偏好快照后
+        按 5 键映射表逐个尝试填入候选参数名，仅当对应槽位缺失或为空字符串时才赋值。
+        """
+        if not isinstance(params, dict):
+            return
+        try:
+            snapshot = self.preference.get_all() or {}
+        except Exception:
+            return
+        if not snapshot:
+            return
+        for pref_key, candidates in self._PREFERENCE_PARAM_MAP.items():
+            value = snapshot.get(pref_key)
+            if value is None or str(value) == "":
+                continue
+            for name in candidates:
+                existing = params.get(name)
+                if existing is None or str(existing) == "":
+                    params[name] = value
+
     def _run_tool_from_set(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message]):
         tool_name = detect_tool(query, tools_map)
         if not tool_name:
             return self._chat_response(mem_prefix, hist_msgs), None
         params = self._parse_tool_params(tool_name, query)
+        # 偏好补全：在 tool_executor.call 之前注入偏好（对应 Go 版 fillParamsFromPreference）
+        self._fill_params_from_preference(params)
         result = self.tool_executor.call(tool_name, params)
         answer = result.content if result.success else f"工具调用失败: {result.error}"
         tool_call = {
@@ -487,13 +597,24 @@ class UnifiedAgent:
         }
         return answer, tool_call
 
-    # ── ReAct 推理循环（保留原 agent.py 的实现） ───────────────────────────
+    # ── 图调度（统一 react 入口） ──────────────────────────────────────────
 
     def _run_react_with_tools(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token):
+        """ReAct 模式入口：与 main 分支 runReAct 行为一致。
+
+        - llm_plan_graph 拿到节点列表；
+        - 节点为空 → 直接调 chat LLM 给一句话回答（对应 Go chatLLM 兜底），不再做工具迭代；
+        - 节点非空 → 走 GraphRuntime 拓扑分层 + race + 重试；执行结束后用
+          _generate_final_answer（对应 Go llmGenerate）合成自然语言回复。
+        """
         task = {"task_id": f"task_{int(time.time())}", "query": query, "status": "running", "steps": []}
         self._cancel_registry.set_task(task)
-        plan_nodes = llm_plan_graph(self, query, tools_map, mem_prefix)
-        if plan_nodes:
+        try:
+            plan_nodes = llm_plan_graph(self, query, tools_map, mem_prefix)
+            if not plan_nodes:
+                # 与 Go runReAct: planNodes 空 → chatLLM 一句话答复
+                return self._chat_response(mem_prefix, hist_msgs), [], task
+
             from internal.graph.task_graph import TaskGraph
 
             graph = TaskGraph(plan_nodes)
@@ -533,110 +654,9 @@ class UnifiedAgent:
                     for node in graph.nodes.values()
                 ]
             }
+            return final_answer, steps, task
+        finally:
             self._cancel_registry.set_task(None)
-            return self._format_react_response(steps), steps, task
-
-        steps: List[ReActStep] = []
-
-        for _ in range(self.max_iterations):
-            if token.is_cancelled():
-                task["status"] = "interrupted"
-                return "[已中断]", steps, task
-            thought = self._generate_thought(query, steps, mem_prefix, tools_map)
-            steps.append(ReActStep(type=StepType.THOUGHT, content=thought))
-            if self._is_complete(thought):
-                final_answer = self._generate_final_answer(query, steps, mem_prefix)
-                steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
-                break
-            action, tool_name, params = self._parse_action(thought, tools_map)
-            if not tool_name:
-                final_answer = self._generate_final_answer(query, steps, mem_prefix)
-                steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
-                break
-            if tool_name not in tools_map:
-                steps.append(ReActStep(type=StepType.OBSERVATION, content=f"工具 {tool_name} 不可用"))
-                break
-            result = self._call_tool_with_retry(tool_name, params)
-            steps.append(ReActStep(type=StepType.ACTION, content=action, tool=tool_name, params=params))
-            steps.append(
-                ReActStep(
-                    type=StepType.OBSERVATION,
-                    content=result.content if result.success else f"失败: {result.error}",
-                )
-            )
-            self._save_snapshot(task["task_id"], steps)
-        else:
-            # 达到最大迭代后强制总结
-            final_answer = self._generate_final_answer(query, steps, mem_prefix)
-            steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
-
-        answer = self._format_react_response(steps)
-        task["status"] = "completed"
-        task["steps"] = [
-            {"type": s.type, "content": s.content, "tool": s.tool, "params": s.params} for s in steps
-        ]
-        # 任务结束再做一次快照
-        self._save_snapshot(task["task_id"], steps)
-        self._cancel_registry.set_task(None)
-        return answer, steps, task
-
-    def _call_tool_with_retry(self, tool_name: str, params: Dict[str, str]):
-        last = None
-        for _ in range(max(1, self.max_retries)):
-            last = self.tool_executor.call(tool_name, params)
-            if last.success:
-                return last
-            time.sleep(self.cfg.retry_delay_ms / 1000.0)
-        return last
-
-    def _generate_thought(self, query: str, steps: List[ReActStep], mem_prefix: str, tools_map: Dict[str, Tool]) -> str:
-        steps_str = "\n".join(f"{s.type}: {s.content}" for s in steps) or "（暂无）"
-        tools_desc = "\n".join(
-            f"- {name}: {tool.description}; 参数: {[p['name'] for p in tool.params]}"
-            for name, tool in tools_map.items()
-        )
-        prompt = f"""你是一个 ReAct 推理助手。请基于任务和已有步骤决定下一步。
-
-可用工具：
-{tools_desc}
-
-任务: {query}
-
-记忆上下文:
-{mem_prefix or '（无）'}
-
-历史步骤:
-{steps_str}
-
-请输出一条决策，必须严格满足以下两种格式之一：
-1) 需要调用工具：    Action: tool_name(key1="value1", key2="value2")
-2) 已可给出答案：    Final: <最终结论>
-
-不要输出额外内容。
-"""
-        messages = [Message(role="user", content=prompt)]
-        return self.llm.chat(messages, system_prompt="你是一个擅长推理的助手，按要求格式输出决策。")
-
-    def _is_complete(self, thought: str) -> bool:
-        return bool(re.search(r"^\s*Final\s*[:：]", thought, re.MULTILINE))
-
-    def _parse_action(self, thought: str, tools_map: Dict[str, Tool]):
-        m = re.search(r"Action\s*[:：]\s*([a-zA-Z_][\w]*)\s*\((.*?)\)", thought, re.DOTALL)
-        if not m:
-            return "", "", {}
-        tool_name = m.group(1)
-        if tool_name not in tools_map:
-            return "", "", {}
-        params: Dict[str, str] = {}
-        raw = m.group(2).strip()
-        if raw:
-            for pair in re.split(r",(?![^\"]*\")", raw):
-                if "=" not in pair:
-                    continue
-                k, v = pair.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                params[k.strip()] = v
-        return f"调用工具 {tool_name}", tool_name, params
 
     def _generate_final_answer(self, query: str, steps: List[ReActStep], mem_prefix: str) -> str:
         steps_str = "\n".join(f"{s.type}: {s.content}" for s in steps)
@@ -655,30 +675,6 @@ class UnifiedAgent:
         messages = [Message(role="user", content=prompt)]
         return self.llm.chat(messages, system_prompt="你是一个总结助手，能够基于推理过程给出简洁的最终答案。")
 
-    def _format_react_response(self, steps: List[ReActStep]) -> str:
-        lines = []
-        for s in steps:
-            if s.type == StepType.THOUGHT:
-                lines.append(f"💭 {s.content}")
-            elif s.type == StepType.ACTION:
-                lines.append(f"⚡ {s.tool}({s.params})")
-            elif s.type == StepType.OBSERVATION:
-                lines.append(f"👁 {s.content}")
-            elif s.type == StepType.FINAL_ANSWER:
-                lines.append(f"\n📝 最终答案:\n{s.content}")
-        return "\n".join(lines)
-
-    def _save_snapshot(self, task_id: str, steps: List[ReActStep]):
-        snapshot = {
-            "task_id": task_id,
-            "steps": [{"type": s.type, "content": s.content, "tool": s.tool, "params": s.params} for s in steps],
-            "timestamp": time.time(),
-        }
-        try:
-            self.inf.save_snapshot(task_id, json.dumps(snapshot, ensure_ascii=False))
-        except Exception as e:
-            logger.warning("⚠️  快照写入失败: %s", e)
-
     def _save_agent_snapshot(self, query: str, resp: Response):
         """每 N 轮把 agent 整体状态序列化到 PG（含路由 mode/计数/偏好）。"""
         snapshot = {
@@ -691,7 +687,7 @@ class UnifiedAgent:
             "timestamp": time.time(),
         }
         try:
-            self.inf.save_snapshot(snapshot["task_id"], json.dumps(snapshot, ensure_ascii=False))
+            self.inf.repo.snapshot.save(snapshot["task_id"], json.dumps(snapshot, ensure_ascii=False))
         except Exception as e:
             logger.warning("⚠️  agent 快照写入失败: %s", e)
 

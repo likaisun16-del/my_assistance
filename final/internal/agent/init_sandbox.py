@@ -86,9 +86,11 @@ def init_sandbox(agent):
 
 def _publish_event(agent, event_type: str, payload: str):
     inf = getattr(agent, "inf", None)
-    if inf is not None and hasattr(inf, "publish_event"):
+    repo = getattr(inf, "repo", None) if inf is not None else None
+    events = getattr(repo, "events", None)
+    if events is not None and hasattr(events, "publish"):
         try:
-            inf.publish_event(event_type, payload)
+            events.publish(event_type, payload)
             return
         except Exception:
             pass
