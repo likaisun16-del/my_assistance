@@ -31,9 +31,16 @@ class LLMReranker:
             return _truncate(results, top_k)
 
         score_map = {idx: score for idx, score in scores if 0 <= idx < len(results)}
+        if len(score_map) != len(results):
+            logger.warning(
+                "⚠️  Rerank scores 数量(%d) != 候选数量(%d)，缺失项补 0、越界项截断",
+                len(score_map), len(results),
+            )
+            for i in range(len(results)):
+                score_map.setdefault(i, 0.0)
         ordered = []
         for idx, result in enumerate(results):
-            llm_score = score_map.get(idx, -1.0)
+            llm_score = score_map.get(idx, 0.0)
             ordered.append((llm_score, getattr(result, "score", 0.0), idx, result))
         ordered.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
 
@@ -47,9 +54,20 @@ class LLMReranker:
 
     def _system_prompt(self) -> str:
         return (
-            "你是检索系统的精排器。给定用户问题和候选段落，"
-            "只输出严格 JSON：{\"scores\": [{\"idx\": 0, \"score\": 9}]}。"
-            "score 为 0 到 10。"
+            "你是检索系统的精排器。给定用户问题和若干候选段落（每条带编号 idx），"
+            "判断每条段落对回答该问题的**相关性 + 信息密度**，给 0~10 的整数分。\n\n"
+            "打分准则：\n"
+            "- 10：直接回答了问题\n"
+            "- 7~9：包含明确相关事实 / 线索\n"
+            "- 4~6：弱相关 / 部分相关\n"
+            "- 1~3：仅出现共现关键词，不能用来回答\n"
+            "- 0：无关 / 噪声\n\n"
+            "输出**严格 JSON**，不要任何说明文字、不要 markdown 代码块：\n"
+            "{\"scores\": [{\"idx\": 0, \"score\": 9}, {\"idx\": 1, \"score\": 3}]}\n\n"
+            "约束：\n"
+            "- scores 数量严格等于候选数量\n"
+            "- score 是 0~10 的整数\n"
+            "- 不依赖你自己的知识，只看给出的段落"
         )
 
     def _user_msg(self, query: str, results: List) -> str:

@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from config.config import APIConfig
 from internal.graph.kgstore import KGStore
 from internal.graph.types import ChunkRef
-from internal.infra.infra import Infrastructure
+from internal.infra.infra import Infrastructure, RAG_COLLECTION
 from internal.llm.llm import Client as LLMClient
 from internal.rag.hybrid import HybridStore
 from internal.rag.rewriter import HistoryMessage
@@ -65,7 +65,7 @@ class Engine:
 
     def _check_existing_chunks(self):
         try:
-            if self.inf.ready.postgresql == "connected" and self.inf.count_rag_chunks() > 0:
+            if self.inf.ready.postgresql == "connected" and self.inf.repo.ragchunk.count() > 0:
                 self.loaded = True
                 logger.info("✅ 检测到知识库中已有文档")
         except Exception as e:
@@ -98,12 +98,9 @@ class Engine:
                 logger.warning("⚠️  RAG chunk 向量化失败，跳过 Milvus 写入 (idx=%d): %s", i, e)
 
             parent_content = child_parents[i] if i < len(child_parents) else ""
-            if hasattr(self.inf, "save_rag_chunk_with_parent"):
-                pg_id = self.inf.save_rag_chunk_with_parent(
-                    doc_hash, i, chunk.content, parent_content, json.dumps(embedding)
-                )
-            else:
-                pg_id = self.inf.save_rag_chunk(doc_hash, i, chunk.content, json.dumps(embedding))
+            pg_id = self.inf.repo.ragchunk.save_pg_with_parent(
+                doc_hash, i, chunk.content, parent_content, json.dumps(embedding)
+            )
             if pg_id > 0:
                 pg_ids.append(pg_id)
                 valid_contents.append(chunk.content)
@@ -111,7 +108,7 @@ class Engine:
                 valid_chunk_idxs.append(i)
                 if self.inf.ready.elasticsearch == "connected":
                     try:
-                        self.inf.index_rag_chunk(pg_id, chunk.content, doc_hash, i)
+                        self.inf.repo.ragchunk.index_es(pg_id, chunk.content, doc_hash, i)
                     except Exception as e:
                         logger.warning("⚠️  RAG chunk 索引到 ES 失败 (pg_id=%s): %s", pg_id, e)
 
@@ -127,7 +124,7 @@ class Engine:
                     milvus_embeddings.append(embedding)
         if milvus_ids:
             try:
-                self.inf.insert_rag_chunks(milvus_ids, milvus_contents, milvus_embeddings)
+                self.inf.repo.ragchunk.insert_milvus(milvus_ids, milvus_contents, milvus_embeddings)
             except Exception as e:
                 logger.warning("⚠️  RAG chunks 写入 Milvus 失败: %s", e)
 
@@ -146,7 +143,7 @@ class Engine:
                 logger.warning("⚠️  RAG chunks 写入 Neo4j 知识图谱失败: %s", e)
 
         self.loaded = True
-        self.inf.publish_event("rag.ingest", json.dumps({
+        self.inf.repo.events.publish("rag.ingest", json.dumps({
             "chunk_count": len(chunks),
             "parent_count": len(parents),
             "doc_hash": doc_hash,
@@ -198,15 +195,15 @@ class Engine:
             try:
                 query_emb = self._llm.embed(question)
                 if query_emb and len(query_emb) == self.cfg.rag_milvus_dim:
-                    milvus_results = self.inf.milvus_search_with_scores(
-                        "rag_embeddings", query_emb, top_k * 2
+                    milvus_results = self.inf.repo.ragchunk.search_milvus_dicts(
+                        query_emb, top_k * 2
                     )
             except Exception as e:
                 logger.warning("⚠️  Milvus 语义检索失败: %s", e)
 
         es_results: List[dict] = []
         if self.inf.ready.elasticsearch == "connected":
-            es_results = self.inf.search_rag_chunks(question, top_k * 2)
+            es_results = self.inf.repo.ragchunk.search_es_dicts(question, top_k * 2)
 
         fused = self._rrf_fuse(milvus_results, es_results, top_k)
         return self._compose_answer(question, fused)

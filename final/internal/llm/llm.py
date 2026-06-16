@@ -2,8 +2,10 @@
 import json
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import requests
 
@@ -46,6 +48,185 @@ class Client:
         if getattr(ctx, "cancelled", False):
             return "[已中断]"
         return self.chat(messages, system_prompt=system_prompt)
+
+    def chat_stream_context(
+        self,
+        ctx,
+        system_prompt: str,
+        messages: List[Message],
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """流式对话调用，对齐 main 分支 Go ChatStreamContext。
+
+        - mock 模式按字符 sleep 0.02s 推送，模拟流式体感。
+        - 真实 API 走 OpenAI 兼容 SSE：``data: {json}\\n``，``data: [DONE]`` 终止。
+        - ``ctx`` 提供 ``is_cancelled()`` 时通过关闭 ``requests.Session`` 触发 ``iter_lines`` 异常。
+        - 异常时已发出的 token 不会回滚；返回累积的 full_text（失败回退到同步 chat）。
+        """
+        is_cancelled = getattr(ctx, "is_cancelled", None)
+
+        def _cancelled() -> bool:
+            try:
+                return bool(is_cancelled and is_cancelled())
+            except Exception:
+                return False
+
+        if not self.cfg.is_real_llm():
+            reply = self._mock(messages)
+            sent = []
+            for ch in reply:
+                if _cancelled():
+                    return "".join(sent)
+                if on_token:
+                    try:
+                        on_token(ch)
+                    except Exception as e:
+                        logger.warning("on_token 回调异常: %s", e)
+                sent.append(ch)
+                time.sleep(0.02)
+            return reply
+
+        try:
+            return self._call_chat_stream(ctx, system_prompt, messages, on_token)
+        except Exception as e:
+            if _cancelled():
+                return "[已中断]"
+            logger.warning("LLM 流式调用失败: %s，回退到同步", e)
+            try:
+                return self._call_chat(system_prompt, messages)
+            except Exception as e2:
+                logger.error("同步回退仍失败: %s", e2)
+                return self._mock(messages)
+
+    def _call_chat_stream(
+        self,
+        ctx,
+        system_prompt: str,
+        messages: List[Message],
+        on_token: Optional[Callable[[str], None]],
+    ) -> str:
+        msgs: List[Dict[str, str]] = []
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        msgs.extend({"role": m.role, "content": m.content} for m in messages)
+
+        payload = {
+            "model": self.cfg.llm_model,
+            "messages": msgs,
+            "temperature": self.cfg.temperature,
+            "stream": True,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.cfg.llm_api_key}",
+            "Accept": "text/event-stream",
+        }
+
+        session = requests.Session()
+        # ctx 透传：cancel 时 close session 触发 iter_lines 异常
+        unbind = self._bind_session_to_ctx(ctx, session)
+
+        full_parts: List[str] = []
+        try:
+            resp = session.post(
+                self.cfg.llm_api_url,
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=(10, 120),
+            )
+            if resp.status_code != 200:
+                body = ""
+                try:
+                    body = resp.text
+                except Exception:
+                    pass
+                raise RuntimeError(f"API 返回错误状态 {resp.status_code}, body: {body}")
+
+            for raw in resp.iter_lines(decode_unicode=True):
+                if raw is None:
+                    continue
+                line = raw.strip() if isinstance(raw, str) else raw
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except Exception:
+                    continue
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    err = chunk["error"]
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    raise RuntimeError(f"API 流式错误: {msg}")
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content") or ""
+                if not content:
+                    continue
+                full_parts.append(content)
+                if on_token:
+                    try:
+                        on_token(content)
+                    except Exception as e:
+                        logger.warning("on_token 回调异常: %s", e)
+            return "".join(full_parts)
+        finally:
+            try:
+                unbind()
+            except Exception:
+                pass
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _bind_session_to_ctx(ctx, session: "requests.Session"):
+        """把 ctx 的 cancel 信号绑到 session.close() 上，返回解绑函数。
+
+        ctx 可暴露 ``register_cancel(callback)``（推荐）或后台轮询
+        ``is_cancelled()``；都不存在时返回 no-op 解绑。
+        """
+        if ctx is None:
+            return lambda: None
+
+        # 优先使用 register_cancel hook
+        register = getattr(ctx, "register_cancel", None)
+        if callable(register):
+            try:
+                handle = register(lambda: _safe_close(session))
+                if callable(handle):
+                    return handle
+                return lambda: None
+            except Exception:
+                pass
+
+        is_cancelled = getattr(ctx, "is_cancelled", None)
+        if not callable(is_cancelled):
+            return lambda: None
+
+        stop_evt = threading.Event()
+
+        def _watch():
+            while not stop_evt.is_set():
+                try:
+                    if is_cancelled():
+                        _safe_close(session)
+                        return
+                except Exception:
+                    return
+                if stop_evt.wait(0.1):
+                    return
+
+        t = threading.Thread(target=_watch, name="llm-stream-cancel", daemon=True)
+        t.start()
+        return lambda: stop_evt.set()
 
     def _call_chat(self, system_prompt: str, messages: List[Message]) -> str:
         msgs: List[Dict[str, str]] = []
@@ -179,3 +360,10 @@ def _extract_rule_based(msg: str) -> Dict[str, str]:
         if len(parts) == 2 and parts[1].strip():
             result["姓名"] = parts[1].strip()
     return result
+
+
+def _safe_close(session: "requests.Session") -> None:
+    try:
+        session.close()
+    except Exception:
+        pass

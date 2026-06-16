@@ -224,7 +224,7 @@ class HybridStore:
 
         # 从 PG 批量取回 chunk 内容
         ids = [pid for pid, _ in sorted_ids]
-        rows = self.inf.load_rag_chunks_by_ids(ids)
+        rows = self.inf.repo.ragchunk.load_by_ids_with_parent(ids)
         row_map: Dict[int, dict] = {r["id"]: r for r in rows}
 
         results: List[HybridResult] = []
@@ -248,7 +248,7 @@ class HybridStore:
         if not path.ok:
             return []
         ids = [h["pg_id"] for h in path.hits if h.get("pg_id") is not None]
-        rows = self.inf.load_rag_chunks_by_ids(ids) if ids else []
+        rows = self.inf.repo.ragchunk.load_by_ids_with_parent(ids) if ids else []
         row_map: Dict[int, dict] = {r["id"]: r for r in rows}
         results: List[HybridResult] = []
         for h in path.hits:
@@ -273,7 +273,7 @@ class HybridStore:
         if not path.ok:
             return []
         ids = [h["pg_id"] for h in path.hits if h.get("pg_id") is not None]
-        rows = self.inf.load_rag_chunks_by_ids(ids) if ids else []
+        rows = self.inf.repo.ragchunk.load_by_ids_with_parent(ids) if ids else []
         row_map: Dict[int, dict] = {r["id"]: r for r in rows}
         results: List[HybridResult] = []
         for h in path.hits:
@@ -314,7 +314,7 @@ class HybridStore:
             )
             return _PathHits(ok=False)
         try:
-            hits = self.inf.milvus_search_with_scores("rag_embeddings", query_emb, fetch_k) or []
+            hits = self.inf.repo.ragchunk.search_milvus_dicts(query_emb, fetch_k) or []
             return _PathHits(hits=hits, ok=True)
         except Exception as e:
             logger.warning("⚠️  Milvus 检索失败: %s", e)
@@ -324,7 +324,7 @@ class HybridStore:
         if not self._es_ok():
             return _PathHits(ok=False)
         try:
-            hits = self.inf.search_rag_chunks(query, fetch_k) or []
+            hits = self.inf.repo.ragchunk.search_es_dicts(query, fetch_k) or []
             return _PathHits(hits=hits, ok=True)
         except Exception as e:
             logger.warning("⚠️  ES 检索失败: %s", e)
@@ -385,7 +385,7 @@ class HybridStore:
         if not ids:
             return []
         ids = ids[:top_k]
-        rows = self.inf.load_rag_chunks_by_ids(ids)
+        rows = self.inf.repo.ragchunk.load_by_ids_with_parent(ids)
         row_map: Dict[int, dict] = {r["id"]: r for r in rows}
         results: List[HybridResult] = []
         for h in kg_hits:

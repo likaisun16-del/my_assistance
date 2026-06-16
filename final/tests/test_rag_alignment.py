@@ -9,17 +9,80 @@ from internal.rag.splitter import RecursiveSplitter
 
 
 def test_recursive_splitter_creates_overlapping_chunks():
-    splitter = RecursiveSplitter(chunk_size=10, overlap=3)
+    splitter = RecursiveSplitter(chunk_size=10, chunk_overlap=3)
 
     chunks = splitter.split("abcdefghijklmnopqrstuvwxyz")
 
-    assert [c.id for c in chunks] == [0, 1, 2, 3]
-    assert [c.content for c in chunks] == [
-        "abcdefghij",
-        "hijklmnopq",
-        "opqrstuvwx",
-        "vwxyz",
-    ]
+    assert [c.id for c in chunks] == list(range(len(chunks)))
+    # 无任何语义分隔符 → 进入兜底硬切，再叠 tail-rune overlap
+    assert chunks[0].content == "abcdefghij"
+    for i in range(1, len(chunks)):
+        prev_tail = chunks[i - 1].content[-3:]
+        assert chunks[i].content.startswith(prev_tail)
+    assert "".join(c.content[3:] if i else c.content
+                   for i, c in enumerate(chunks)) == "abcdefghijklmnopqrstuvwxyz"
+
+
+def test_recursive_splitter_basic():
+    text = (
+        "第一段开头。第一段中间。第一段结尾。\n\n"
+        "第二段第一句。第二段第二句。第二段第三句。\n\n"
+        "第三段只有一句。"
+    )
+    splitter = RecursiveSplitter(chunk_size=20, chunk_overlap=0)
+
+    chunks = splitter.split(text)
+
+    assert chunks, "应至少产出一个 chunk"
+    for c in chunks:
+        assert len(c.content) <= 20, f"chunk 超长: {c.content!r}"
+    joined = "".join(c.content for c in chunks)
+    # 递归切只删去 strip 后为空的纯空白片段，正文字符应保留
+    for ch in "第一段中间第二段第三句":
+        assert ch in joined
+
+
+def test_recursive_splitter_code_fence():
+    code = "```python\ndef foo():\n    return 'a very long line that exceeds the chunk size easily'\n```"
+    text = f"前置说明文本。\n\n{code}\n\n后置说明文本。"
+    splitter = RecursiveSplitter(chunk_size=30, chunk_overlap=0)
+
+    chunks = splitter.split(text)
+    contents = [c.content for c in chunks]
+
+    assert any(code in c for c in contents), \
+        f"代码块应作为原子片段完整保留，实际 chunks={contents!r}"
+    # 确认代码块没有被中间切开：不存在仅含部分 fence 的 chunk
+    for c in contents:
+        if "```" in c:
+            assert c.count("```") % 2 == 0, f"代码块被截断: {c!r}"
+
+
+def test_recursive_splitter_chinese_overlap():
+    # 含中文 + emoji（部分 emoji 在 UTF-16 下是代理对，Python str 按 code point 切）
+    text = "你好世界🌍🚀。今天的天气真不错。我们一起去公园散步吧。再聊聊技术话题哦。最后一段尾声。"
+    splitter = RecursiveSplitter(chunk_size=15, chunk_overlap=3)
+
+    chunks = splitter.split(text)
+
+    assert len(chunks) >= 2
+    # Python str 切片天然按 code point，不会出现半字
+    for c in chunks:
+        assert len(c.content) >= 1
+        for ch in c.content:
+            assert isinstance(ch, str) and len(ch) == 1
+    # 相邻 chunk 必须存在 rune 级 overlap：cur 的开头与 prev 的某个后缀完整相等
+    for i in range(1, len(chunks)):
+        prev = chunks[i - 1].content
+        cur = chunks[i].content
+        max_n = min(splitter.chunk_overlap, len(prev), len(cur))
+        assert max_n > 0
+        assert any(prev.endswith(cur[:n]) and n > 0 for n in range(1, max_n + 1)), (
+            f"overlap 未按 rune 对齐: prev_tail={prev[-max_n:]!r} cur_head={cur[:max_n]!r}"
+        )
+    # emoji 必须保留为完整 code point
+    joined = "".join(c.content for c in chunks)
+    assert "🌍" in joined and "🚀" in joined
 
 
 def test_rewriter_returns_deduplicated_queries_from_json():
@@ -76,6 +139,61 @@ def test_reranker_falls_back_to_rrf_order_on_bad_json():
     assert [r.content for r in reranked] == ["first"]
 
 
+class _FakeRagchunkRepo:
+    def __init__(self, infra):
+        self.infra = infra
+
+    def count(self):
+        return len(self.infra.saved_chunks)
+
+    def load_by_ids_with_parent(self, ids):
+        return [self.infra.rows[i] for i in ids if i in self.infra.rows]
+
+    def search_milvus_dicts(self, _embedding, _top_k):
+        return [{"pg_id": 1, "score": 0.9}, {"pg_id": 2, "score": 0.8}]
+
+    def search_es_dicts(self, query, _top_k):
+        if "alt" in query:
+            return [{"pg_id": 2, "score": 10.0}, {"pg_id": 3, "score": 9.0}]
+        return [{"pg_id": 1, "score": 10.0}, {"pg_id": 3, "score": 8.0}]
+
+    def save_pg_with_parent(self, doc_hash, chunk_idx, content, parent_content, embedding_json):
+        pg_id = self.infra.next_id
+        self.infra.next_id += 1
+        self.infra.saved_chunks.append({
+            "id": pg_id,
+            "doc_hash": doc_hash,
+            "chunk_idx": chunk_idx,
+            "content": content,
+            "parent_content": parent_content,
+            "embedding_json": embedding_json,
+        })
+        self.infra.rows[pg_id] = {"id": pg_id, "content": content, "parent_content": parent_content}
+        return pg_id
+
+    def save_pg(self, doc_hash, chunk_idx, content, embedding_json):
+        return self.save_pg_with_parent(doc_hash, chunk_idx, content, "", embedding_json)
+
+    def insert_milvus(self, pg_ids, contents, embeddings):
+        self.infra.inserted_milvus.append((pg_ids, contents, embeddings))
+
+    def index_es(self, pg_id, content, doc_hash, chunk_idx):
+        self.infra.indexed_chunks.append({
+            "pg_id": pg_id,
+            "content": content,
+            "doc_hash": doc_hash,
+            "chunk_idx": chunk_idx,
+        })
+
+
+class _FakeEventsRepo:
+    def __init__(self, infra):
+        self.infra = infra
+
+    def publish(self, event_type, payload):
+        self.infra.events.append((event_type, payload))
+
+
 class _FakeInfra:
     def __init__(self):
         self.ready = SimpleNamespace(postgresql="connected", milvus="connected", elasticsearch="connected")
@@ -89,51 +207,10 @@ class _FakeInfra:
         }
         self.next_id = 10
         self.events = []
-
-    def count_rag_chunks(self):
-        return len(self.saved_chunks)
-
-    def load_rag_chunks_by_ids(self, ids):
-        return [self.rows[i] for i in ids if i in self.rows]
-
-    def milvus_search_with_scores(self, _collection, _embedding, _top_k):
-        return [{"pg_id": 1, "score": 0.9}, {"pg_id": 2, "score": 0.8}]
-
-    def search_rag_chunks(self, query, _top_k):
-        if "alt" in query:
-            return [{"pg_id": 2, "score": 10.0}, {"pg_id": 3, "score": 9.0}]
-        return [{"pg_id": 1, "score": 10.0}, {"pg_id": 3, "score": 8.0}]
-
-    def save_rag_chunk_with_parent(self, doc_hash, chunk_idx, content, parent_content, embedding_json):
-        pg_id = self.next_id
-        self.next_id += 1
-        self.saved_chunks.append({
-            "id": pg_id,
-            "doc_hash": doc_hash,
-            "chunk_idx": chunk_idx,
-            "content": content,
-            "parent_content": parent_content,
-            "embedding_json": embedding_json,
-        })
-        self.rows[pg_id] = {"id": pg_id, "content": content, "parent_content": parent_content}
-        return pg_id
-
-    def save_rag_chunk(self, doc_hash, chunk_idx, content, embedding_json):
-        return self.save_rag_chunk_with_parent(doc_hash, chunk_idx, content, "", embedding_json)
-
-    def insert_rag_chunks(self, pg_ids, contents, embeddings):
-        self.inserted_milvus.append((pg_ids, contents, embeddings))
-
-    def index_rag_chunk(self, pg_id, content, doc_hash, chunk_idx):
-        self.indexed_chunks.append({
-            "pg_id": pg_id,
-            "content": content,
-            "doc_hash": doc_hash,
-            "chunk_idx": chunk_idx,
-        })
-
-    def publish_event(self, event_type, payload):
-        self.events.append((event_type, payload))
+        self.repo = SimpleNamespace(
+            ragchunk=_FakeRagchunkRepo(self),
+            events=_FakeEventsRepo(self),
+        )
 
 
 class _FakeCfg:
@@ -304,3 +381,56 @@ def test_llm_embed_does_not_return_mock_vector_when_unconfigured():
         assert "未配置" in str(e)
     else:
         raise AssertionError("embed should raise instead of returning a mock vector")
+
+
+def test_save_rag_chunk_with_parent_is_idempotent_upsert():
+    """重复 ingest 同一 (doc_hash, chunk_idx) 不应触发 UNIQUE 冲突。
+
+    对齐 main 分支 Go 实现 (internal/infrastructure/persistence/ragchunk/ragchunk.go
+    SavePGWithParent)：使用 ON CONFLICT (doc_hash, chunk_idx) DO UPDATE，
+    返回的 id 应保持稳定。
+    """
+    from internal.repo.ragchunk import Store
+
+    executed = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+        def fetchone(self):
+            return (42,)
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakePG:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def is_real(self):
+            return True
+
+    store = Store(FakePG(FakeConn()), None, None)
+
+    id1 = store.save_pg_with_parent("doc-hash-x", 0, "c1", "p1", "[]")
+    id2 = store.save_pg_with_parent("doc-hash-x", 0, "c2", "p2", "[]")
+
+    assert id1 == 42 and id2 == 42, "重复写入应返回相同的 id"
+    assert len(executed) == 2
+    for sql, params in executed:
+        assert "ON CONFLICT" in sql
+        assert "(doc_hash, chunk_idx)" in sql
+        assert "EXCLUDED.content" in sql
+        assert "EXCLUDED.parent_content" in sql
+        assert "EXCLUDED.embedding" in sql
+        assert "RETURNING id" in sql
+        assert params is not None and params[0] == "doc-hash-x" and params[1] == 0
+

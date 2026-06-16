@@ -8,15 +8,24 @@ from config.config import APIConfig
 logger = logging.getLogger(__name__)
 
 try:
-    from pymilvus import MilvusClient
+    from pymilvus import DataType, MilvusClient
     _HAS_MILVUS = True
 except ImportError:
+    DataType = None  # type: ignore
     MilvusClient = None  # type: ignore
     _HAS_MILVUS = False
 
 
-# 默认 RAG 集合名（与 infra 旧实现保持一致）
-DEFAULT_RAG_COLLECTION = "rag_embeddings"
+# 默认 RAG 集合名（与 main 分支 Go 实现 internal/infrastructure/persistence/ragchunk 对齐）
+DEFAULT_RAG_COLLECTION = "rag_chunks"
+
+# 索引参数（与 Go 端 entity.NewIndexIvfFlat(entity.L2, 128) 对齐）
+_RAG_INDEX_TYPE = "IVF_FLAT"
+_RAG_METRIC_TYPE = "L2"
+_RAG_INDEX_NLIST = 128
+
+# content 字段最大长度（与 Go 端 TypeParams["max_length"]=4096 对齐）
+_RAG_CONTENT_MAX_LEN = 4096
 
 
 class MilvusClientWrapper:
@@ -64,29 +73,122 @@ class MilvusClientWrapper:
 
     # ─── 集合初始化 ───
     def _init_default_collections(self) -> None:
-        """启动期幂等创建默认 RAG 集合。"""
+        """启动期幂等创建默认 RAG 集合，并校验维度 / 主键。"""
         if self._client is None:
             return
         dim = int(self.cfg.rag_milvus_dim or 1024)
         try:
-            if not self._client.has_collection(DEFAULT_RAG_COLLECTION):
-                self._client.create_collection(
-                    collection_name=DEFAULT_RAG_COLLECTION,
-                    dimension=dim,
-                    auto_id=True,
-                    enable_dynamic_field=True,
-                )
-                logger.info("✅ Milvus 集合 %s 已创建 (dim=%d)", DEFAULT_RAG_COLLECTION, dim)
+            if self._client.has_collection(DEFAULT_RAG_COLLECTION):
+                # 集合已存在：仅校验 schema，发现不一致只 warning，不删用户数据
+                self._verify_rag_schema(DEFAULT_RAG_COLLECTION, dim)
+                return
+            self._create_rag_collection(DEFAULT_RAG_COLLECTION, dim)
         except Exception as e:
             logger.warning("⚠️  Milvus 创建集合失败: %s", e)
 
+    def _create_rag_collection(self, collection_name: str, dim: int) -> None:
+        """以显式 schema 创建 RAG 集合：pg_id/content/embedding。"""
+        if self._client is None or DataType is None:
+            return
+        # 显式 schema：与 Go 端 entity.Schema 对齐
+        schema = self._client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(
+            field_name="pg_id", datatype=DataType.INT64, is_primary=True
+        )
+        schema.add_field(
+            field_name="content",
+            datatype=DataType.VARCHAR,
+            max_length=_RAG_CONTENT_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=dim
+        )
+
+        # 索引参数：IVF_FLAT + L2 + nlist=128
+        index_params = self._client.prepare_index_params()
+        index_params.add_index(
+            field_name="embedding",
+            index_type=_RAG_INDEX_TYPE,
+            metric_type=_RAG_METRIC_TYPE,
+            params={"nlist": _RAG_INDEX_NLIST},
+        )
+
+        self._client.create_collection(
+            collection_name=collection_name,
+            schema=schema,
+            index_params=index_params,
+        )
+        logger.info(
+            "✅ Milvus 集合 %s 已创建 (dim=%d, index=%s, metric=%s, nlist=%d)",
+            collection_name, dim, _RAG_INDEX_TYPE, _RAG_METRIC_TYPE, _RAG_INDEX_NLIST,
+        )
+
+    def _verify_rag_schema(self, collection_name: str, expected_dim: int) -> None:
+        """校验已存在集合的 PK 名 / 向量维度，不一致只打 warning。"""
+        if self._client is None:
+            return
+        try:
+            desc = self._client.describe_collection(collection_name)
+        except Exception as e:
+            logger.warning("⚠️  Milvus describe_collection(%s) 失败: %s", collection_name, e)
+            return
+
+        fields = []
+        if isinstance(desc, dict):
+            fields = desc.get("fields") or []
+        else:
+            fields = getattr(desc, "fields", []) or []
+
+        pk_name: Optional[str] = None
+        embedding_dim: Optional[int] = None
+        for f in fields:
+            name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
+            is_primary = (
+                f.get("is_primary") if isinstance(f, dict) else getattr(f, "is_primary", False)
+            )
+            if is_primary:
+                pk_name = name
+            if name == "embedding":
+                params = (
+                    f.get("params") if isinstance(f, dict) else getattr(f, "params", {})
+                ) or {}
+                if isinstance(params, dict):
+                    raw_dim = params.get("dim")
+                    try:
+                        embedding_dim = int(raw_dim) if raw_dim is not None else None
+                    except (TypeError, ValueError):
+                        embedding_dim = None
+
+        if pk_name is not None and pk_name != "pg_id":
+            logger.warning(
+                "⚠️  Milvus 集合 %s 主键字段名不一致 (expected=pg_id, actual=%s)，"
+                "请手动 drop 旧集合后重新 ingest 全量数据",
+                collection_name, pk_name,
+            )
+        if embedding_dim is not None and embedding_dim != expected_dim:
+            logger.warning(
+                "⚠️  Milvus 集合 %s embedding 维度不一致 (expected=%d, actual=%d)，"
+                "请手动 drop 旧集合后重新 ingest 全量数据",
+                collection_name, expected_dim, embedding_dim,
+            )
+
     def ensure_collection(self, collection_name: str, dimension: int,
                           auto_id: bool = True, enable_dynamic_field: bool = True) -> bool:
-        """幂等创建任意业务集合。"""
+        """幂等创建任意业务集合。
+
+        对默认 RAG 集合 (rag_chunks) 走显式 schema 路径以保证 schema/index 与 Go 对齐；
+        其它集合走 pymilvus 的简易 schema（dimension 参数）兼容旧调用方。
+        """
         if self._client is None:
             return False
         try:
-            if not self._client.has_collection(collection_name):
+            if self._client.has_collection(collection_name):
+                if collection_name == DEFAULT_RAG_COLLECTION:
+                    self._verify_rag_schema(collection_name, dimension)
+                return True
+            if collection_name == DEFAULT_RAG_COLLECTION:
+                self._create_rag_collection(collection_name, dimension)
+            else:
                 self._client.create_collection(
                     collection_name=collection_name,
                     dimension=dimension,

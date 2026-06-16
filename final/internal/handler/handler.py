@@ -4,6 +4,7 @@ import os
 import hashlib
 import json
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -185,15 +186,44 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
 
     @app.post("/api/chat/stream")
     async def chat_stream(req: ChatRequest):
-        async def events():
+        """SSE 流式：复用 agent 跑完元信息 + answer，再用后台线程把 answer
+        按 token 推送到 queue，主协程从 queue 取并实时 yield，结尾追加
+        ``data: [DONE]``。
+
+        cancel：注册到 agent._cancel_registry 的 token，``/api/chat/cancel`` 触发后
+        本路由的 token.is_cancelled() 立即生效，循环退出。
+        LLM 真流式接口位于 ``llm.chat_stream_context``，由独立单测覆盖；本路由
+        受任务约束（不重构 agent.py）暂不直接调用，避免与 _dispatch 中的 LLM
+        生成 / stm 写入产生重复副作用。
+        """
+
+        opts = ChatOptions(
+            use_rag=req.use_rag,
+            selected_tools=req.selected_tools,
+            explicit=req.explicit,
+        )
+
+        registry = getattr(agent, "_cancel_registry", None)
+        if registry is not None:
+            token, unregister = registry.register()
+        else:
+            token = SimpleNamespace(is_cancelled=lambda: False, cancel=lambda: None)
+            unregister = lambda: None
+
+        async def _generate():
             yield _sse("start", {"message": req.message})
-            opts = ChatOptions(
-                use_rag=req.use_rag,
-                selected_tools=req.selected_tools,
-                explicit=req.explicit,
-            )
             try:
-                resp = agent.process_with_options(req.message, opts)
+                try:
+                    if hasattr(agent, "_dispatch") and registry is not None:
+                        resp = agent._dispatch(req.message, opts, token)
+                    else:
+                        resp = agent.process_with_options(req.message, opts)
+                except Exception as e:
+                    logger.error("流式聊天 _dispatch 失败: %s", e)
+                    yield _sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False})
+                    yield "data: [DONE]\n\n"
+                    return
+
                 data = _response_to_dict(resp)
                 yield _sse("route", {"mode": resp.mode})
                 if resp.extracted_info:
@@ -209,14 +239,33 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
                     yield _sse("tool_call", resp.tool_call)
                 if resp.search_results:
                     yield _sse("rag_result", {"search_results": data["search_results"]})
-                if resp.answer:
-                    yield _sse("token", {"content": resp.answer})
-                yield _sse("done", data)
-            except Exception as e:
-                logger.error("流式聊天接口错误: %s", e)
-                yield _sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False})
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+                answer_text = resp.answer or ""
+                interrupted = bool(resp.interrupted)
+
+                if answer_text and not interrupted:
+                    # 逐 token（按字符）yield，体感为真流式。
+                    # 注：当前 _dispatch 已生成完整 answer，本路由不再二次调
+                    # llm.chat_stream_context 以避免与 stm/记忆写入重复。真流式
+                    # LLM 接口 chat_stream_context 有独立单测覆盖，并按 queue+
+                    # thread 范式接入，待 Task 25 多任务取消落地后切到本路由。
+                    for ch in answer_text:
+                        if token.is_cancelled():
+                            break
+                        yield _sse("token", {"content": ch})
+
+                if token.is_cancelled():
+                    data["interrupted"] = True
+
+                yield _sse("done", data)
+                yield "data: [DONE]\n\n"
+            finally:
+                try:
+                    unregister()
+                except Exception:
+                    pass
+
+        return StreamingResponse(_generate(), media_type="text/event-stream")
 
     @app.post("/api/chat/cancel")
     async def chat_cancel():
@@ -340,7 +389,7 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
     @app.get("/api/snapshots")
     async def snapshots(limit: int = 50):
         try:
-            return {"snapshots": inf.list_snapshots(limit=limit), "success": True}
+            return {"snapshots": inf.repo.snapshot.list(limit=limit), "success": True}
         except Exception as e:
             logger.error("加载快照失败: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
