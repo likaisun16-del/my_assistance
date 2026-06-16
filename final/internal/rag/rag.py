@@ -38,8 +38,7 @@ class Engine:
         self._kg: Optional[KGStore] = None
         # 三路混合检索（Milvus + ES + KG），由 cfg.enable_hybrid_search 控制是否启用
         self._hybrid: Optional[HybridStore] = None
-        if getattr(cfg, "enable_hybrid_search", False):
-            self._hybrid = HybridStore(cfg, inf, embed_fn=self._llm.embed)
+        self._hybrid = HybridStore(cfg, inf, embed_fn=self._llm.embed)
         self._check_existing_chunks()
 
     def set_generate_fn(self, fn: Callable[[str, str], str]):
@@ -85,62 +84,28 @@ class Engine:
         if not chunks:
             return 0
 
-        pg_ids: List[int] = []
-        valid_contents: List[str] = []
-        valid_embeddings: List[List[float]] = []
-        valid_chunk_idxs: List[int] = []
         doc_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()[:16]
+        contents = [chunk.content for chunk in chunks]
+        embeddings: List[List[float]] = []
         for i, chunk in enumerate(chunks):
             embedding: List[float] = []
             try:
                 embedding = self._llm.embed(chunk.content)
             except Exception as e:
                 logger.warning("⚠️  RAG chunk 向量化失败，跳过 Milvus 写入 (idx=%d): %s", i, e)
+            embeddings.append(embedding)
 
-            parent_content = child_parents[i] if i < len(child_parents) else ""
-            pg_id = self.inf.repo.ragchunk.save_pg_with_parent(
-                doc_hash, i, chunk.content, parent_content, json.dumps(embedding)
-            )
-            if pg_id > 0:
-                pg_ids.append(pg_id)
-                valid_contents.append(chunk.content)
-                valid_embeddings.append(embedding)
-                valid_chunk_idxs.append(i)
-                if self.inf.ready.elasticsearch == "connected":
-                    try:
-                        self.inf.repo.ragchunk.index_es(pg_id, chunk.content, doc_hash, i)
-                    except Exception as e:
-                        logger.warning("⚠️  RAG chunk 索引到 ES 失败 (pg_id=%s): %s", pg_id, e)
-
-        # 仅在 Milvus 真实连接 + embedding 维度匹配时才插入
-        milvus_ids: List[int] = []
-        milvus_contents: List[str] = []
-        milvus_embeddings: List[List[float]] = []
-        if self.inf.ready.milvus == "connected":
-            for pg_id, content, embedding in zip(pg_ids, valid_contents, valid_embeddings):
-                if embedding and len(embedding) == self.cfg.rag_milvus_dim:
-                    milvus_ids.append(pg_id)
-                    milvus_contents.append(content)
-                    milvus_embeddings.append(embedding)
-        if milvus_ids:
-            try:
-                self.inf.repo.ragchunk.insert_milvus(milvus_ids, milvus_contents, milvus_embeddings)
-            except Exception as e:
-                logger.warning("⚠️  RAG chunks 写入 Milvus 失败: %s", e)
-
-        # 写入知识图谱（best-effort，不阻塞主入库流程）。
-        # 仅当 KGStore 已注入且底层 Neo4j 真实连接时执行。
-        if self._kg is not None and self._kg.available() and pg_ids:
-            try:
-                refs = [
-                    ChunkRef(id=idx, pg_id=pg_id, content=content)
-                    for idx, pg_id, content in zip(
-                        valid_chunk_idxs, pg_ids, valid_contents
-                    )
-                ]
-                self._kg.index_document(doc_hash, refs)
-            except Exception as e:
-                logger.warning("⚠️  RAG chunks 写入 Neo4j 知识图谱失败: %s", e)
+        if self._hybrid is not None:
+            pg_ids = self._hybrid.index_with_parents(doc_hash, contents, child_parents, embeddings)
+        else:
+            pg_ids = []
+            for i, chunk in enumerate(chunks):
+                parent_content = child_parents[i] if i < len(child_parents) else ""
+                pg_id = self.inf.repo.ragchunk.save_pg_with_parent(
+                    doc_hash, i, chunk.content, parent_content, json.dumps(embeddings[i] if i < len(embeddings) else [])
+                )
+                if pg_id > 0:
+                    pg_ids.append(pg_id)
 
         self.loaded = True
         self.inf.repo.events.publish("rag.ingest", json.dumps({
@@ -168,14 +133,8 @@ class Engine:
             if rewritten:
                 queries = rewritten
 
-        # 优先走三路混合检索（开关：cfg.enable_hybrid_search）。
-        # 仅在 ES + Milvus 都连接时启用，否则降级到单路语义/关键词或老 RRF 路径。
-        if (
-            self._hybrid is not None
-            and self.inf.ready.elasticsearch == "connected"
-            and self.inf.ready.milvus == "connected"
-            and self._llm.cfg.is_real_embedding()
-        ):
+        # 统一走 HybridStore.search_multi；基础设施可用性与模式切换由 HybridStore 内部决定。
+        if self._hybrid is not None:
             hybrid_hits = self._hybrid.search_multi(queries, top_k)
             fused = [
                 {
@@ -189,24 +148,21 @@ class Engine:
             ask_query = queries[0] if queries else question
             return self._compose_answer(ask_query, fused)
 
-        # 仅当 Milvus 真实连接且 embedding 真实可用时使用语义路
-        milvus_results: List[dict] = []
-        if self.inf.ready.milvus == "connected" and self._llm.cfg.is_real_embedding():
-            try:
-                query_emb = self._llm.embed(question)
-                if query_emb and len(query_emb) == self.cfg.rag_milvus_dim:
-                    milvus_results = self.inf.repo.ragchunk.search_milvus_dicts(
-                        query_emb, top_k * 2
-                    )
-            except Exception as e:
-                logger.warning("⚠️  Milvus 语义检索失败: %s", e)
+        if self._hybrid is not None:
+            hybrid_hits = self._hybrid.search_multi(queries, top_k)
+            fused = [
+                {
+                    "pg_id": h.pg_id,
+                    "content": h.parent or h.content,
+                    "score": h.score,
+                    "source": h.source,
+                }
+                for h in hybrid_hits
+            ]
+            ask_query = queries[0] if queries else question
+            return self._compose_answer(ask_query, fused)
 
-        es_results: List[dict] = []
-        if self.inf.ready.elasticsearch == "connected":
-            es_results = self.inf.repo.ragchunk.search_es_dicts(question, top_k * 2)
-
-        fused = self._rrf_fuse(milvus_results, es_results, top_k)
-        return self._compose_answer(question, fused)
+        return self._compose_answer(question, [])
 
     def _compose_answer(self, question: str, fused: List[dict]) -> Tuple[str, List[dict]]:
         fused = self._dedupe_results_by_content(fused)
@@ -239,52 +195,3 @@ class Engine:
             seen.add(content)
             deduped.append(item)
         return deduped
-
-    def _rrf_fuse(
-        self,
-        milvus_results: List[dict],
-        es_results: List[dict],
-        top_k: int,
-    ) -> List[dict]:
-        """Reciprocal Rank Fusion: score(d) = Σ 1/(k + rank_i(d))。"""
-        k = self.cfg.rrf_constant_k if self.cfg.rrf_constant_k > 0 else 60
-
-        # key 用 pg_id 优先，回退到 content 前缀
-        merged: Dict[str, dict] = {}
-        scores: Dict[str, float] = {}
-
-        def _key(item: dict) -> str:
-            pg_id = item.get("pg_id")
-            if pg_id is not None:
-                return f"id:{pg_id}"
-            return f"c:{(item.get('content') or '')[:100]}"
-
-        for rank, item in enumerate(milvus_results):
-            key = _key(item)
-            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-            if key not in merged:
-                merged[key] = {
-                    "pg_id": item.get("pg_id"),
-                    "content": item.get("content", ""),
-                    "score": 0.0,
-                    "source": "milvus",
-                }
-
-        for rank, item in enumerate(es_results):
-            key = _key(item)
-            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-            if key not in merged:
-                merged[key] = {
-                    "pg_id": item.get("pg_id"),
-                    "content": item.get("content", ""),
-                    "score": 0.0,
-                    "source": "es",
-                }
-            else:
-                merged[key]["source"] = "hybrid"
-
-        for key, item in merged.items():
-            item["score"] = scores[key]
-
-        sorted_items = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
-        return sorted_items[:top_k]

@@ -73,26 +73,26 @@
 - [ ] `mem_stack.py` 已抽出，含 `ConsolidationConfig` 7 字段
 - [ ] `ToolExecutor` 注册表带 `threading.RLock`
 - [ ] bootstrap 4 路并发（rag_chunk init / restore_from_db / restore_rag_from_db / init_sandbox）
-- [ ] `agent.status()` 输出 rag_loaded / rag_mode / rag_chunks / 各 count / llm_model / embedding_model / is_mock / infrastructure
-- [ ] PG 使用 `ThreadedConnectionPool`（min=5 / max=25）
-- [ ] `memory.consolidate` 与 `longterm.update` 调 `inf.publish_event` 审计事件
+- [x] `agent.status()` 输出 rag_loaded / rag_mode / rag_chunks / 各 count / llm_model / embedding_model / is_mock / infrastructure
+- [x] PG 使用 `ThreadedConnectionPool`（min=5 / max=25）
+- [x] `memory.consolidate` 与 `longterm.update` 调 `inf.publish_event` 审计事件
 
 ## Phase 5：包结构与小修
 
-- [ ] `DAG.NodeType` 含 `THINK` 与 `AGGREGATE`
-- [ ] `graph_runtime` race_group 改用 first-success 触发 cancel token
-- [ ] `final/internal/sandbox/factory.py` 已抽出
-- [ ] `config.py` 使用 pydantic 严格解析，未知字段报错
-- [ ] `main.py` 引入 Deps dataclass 容器，显式注入 KGStore 给 agent
-- [ ] `/api/rag/query` 路由已删除；`/health` 保留
-- [ ] `rag.py` 删除 `_rrf_fuse`，统一 `HybridStore.search_multi`
-- [ ] hybrid 删除 `_normalized_weights` / `_materialize_kg_only`
-- [ ] `rag.ingest` 不再直接写 PG/ES/Milvus，全部走 hybrid 层
-- [ ] KG 写入异步线程 + panic recover
+- [x] `DAG.NodeType` 含 `THINK` 与 `AGGREGATE`
+- [x] `graph_runtime` race_group 改用 first-success 触发 cancel token
+- [x] `final/internal/sandbox/factory.py` 已抽出
+- [x] `config.py` 使用 pydantic 严格解析，未知字段报错
+- [x] `main.py` 引入 Deps dataclass 容器，显式注入 KGStore 给 agent
+- [x] `/api/rag/query` 路由已删除；`/health` 保留
+- [x] `rag.py` 删除 `_rrf_fuse`，统一 `HybridStore.search_multi`
+- [x] hybrid 删除 `_normalized_weights` / `_materialize_kg_only`
+- [x] `rag.ingest` 不再直接写 PG/ES/Milvus，全部走 hybrid 层
+- [x] KG 写入异步线程 + panic recover
 
 ## REMOVED 验证
 
 - [ ] 旧定长滑窗 splitter 实现已物理删除
 - [ ] 旧 ReAct 迭代分支已物理删除
-- [ ] hybrid `_normalized_weights` / `_materialize_kg_only` 已物理删除
-- [ ] handler `/api/rag/query` 注册代码已删除
+- [x] hybrid `_normalized_weights` / `_materialize_kg_only` 已物理删除
+- [x] handler `/api/rag/query` 注册代码已删除

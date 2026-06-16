@@ -13,7 +13,10 @@ def test_documents_api_lists_writes_reads_and_ingests():
 
     status, payload = _request(app, "GET", "/api/documents")
     assert status == 200
-    assert json.loads(payload)["documents"][0]["id"] == "doc_1"
+    listed = json.loads(payload)["documents"][0]
+    assert listed["id"] == "doc_1"
+    assert listed["latest_metadata"]["text_chars"] == 128
+    assert listed["latest_parser"] == "plain_text"
 
     status, payload = _request(
         app,
@@ -100,7 +103,7 @@ class DocumentAPIAgent:
             document_id="doc_1",
             version=1,
             content_md="# 正文",
-            metadata={},
+            metadata={"filename": "报告.md", "parser": "plain_text", "text_chars": 128},
         )
         self.written = {}
 
@@ -134,6 +137,15 @@ class _SnapshotRepo:
         return []
 
 
+class _DocumentRepo:
+    def __init__(self, agent):
+        self.agent = agent
+
+    def get_version(self, version_id):
+        assert version_id == "ver_1"
+        return self.agent.version
+
+
 class _Infra:
     ready = SimpleNamespace(
         milvus="connected",
@@ -142,14 +154,15 @@ class _Infra:
         kafka="disconnected",
     )
 
-    repo = SimpleNamespace(snapshot=_SnapshotRepo())
+    def __init__(self, agent):
+        self.repo = SimpleNamespace(snapshot=_SnapshotRepo(), documents=_DocumentRepo(agent))
 
 
 def _client(agent):
     cfg = APIConfig()
     cfg.llm_model = "llm"
     cfg.embedding_model = "embedding"
-    return setup_routes(agent, _Infra(), cfg)
+    return setup_routes(agent, _Infra(agent), cfg)
 
 
 def _request(app, method, path, body=b"", content_type="application/json"):

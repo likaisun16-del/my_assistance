@@ -22,26 +22,9 @@ def init_sandbox(agent):
         return
 
     try:
-        from internal.sandbox.executor import Sandbox
-        from internal.sandbox.types import SandboxConfig, SecurityConfig
+        from internal.sandbox.factory import create_sandbox
 
-        sb_cfg = SandboxConfig(
-            image=agent.cfg.sandbox_image,
-            timeout=(agent.cfg.sandbox_timeout_ms or 0) / 1000.0,
-            max_output_bytes=agent.cfg.sandbox_max_output,
-            memory_limit_mb=agent.cfg.sandbox_memory_mb,
-            cpu_percent=agent.cfg.sandbox_cpu_percent,
-            max_pids=agent.cfg.sandbox_max_pids,
-            network_disabled=agent.cfg.sandbox_net_disabled,
-            readonly_rootfs=agent.cfg.sandbox_readonly,
-        )
-        sec_cfg = SecurityConfig(
-            max_command_length=agent.cfg.sec_max_cmd_length,
-            allowlist_mode=agent.cfg.sec_allowlist_mode,
-            allowlist=list(agent.cfg.sec_allowlist or []),
-        )
-
-        sb = Sandbox(agent.cfg.sandbox_backend, sb_cfg, sec_cfg)
+        sb = create_sandbox(agent.cfg)
 
         # 审计：将每条命令执行结果发送到 Kafka（字段对齐 Go 版 initSandbox）
         def _audit(r):

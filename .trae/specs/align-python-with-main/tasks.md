@@ -124,33 +124,33 @@
 
 - [x] Task 28: bootstrap 4 路并发（rag_chunk init / restore_from_db / restore_rag_from_db / init_sandbox）
 
-- [ ] Task 29: agent.status() 统一可观测出口
+- [x] Task 29: agent.status() 统一可观测出口
 
-- [ ] Task 30: Postgres ThreadedConnectionPool（min/max=5/25）
+- [x] Task 30: Postgres ThreadedConnectionPool（min/max=5/25）
 
-- [ ] Task 31: memory.consolidate / longterm.update 等位置补 `inf.publish_event` 审计事件
+- [x] Task 31: memory.consolidate / longterm.update 等位置补 `inf.publish_event` 审计事件
 
 ## Phase 5：包结构与小修（P2）
 
-- [ ] Task 32: DAG.NodeType 补 THINK / AGGREGATE
+- [x] Task 32: DAG.NodeType 补 THINK / AGGREGATE
 
-- [ ] Task 33: graph_runtime race_group 改 first-success cancel token
+- [x] Task 33: graph_runtime race_group 改 first-success cancel token
 
-- [ ] Task 34: 抽 sandbox/factory.py
+- [x] Task 34: 抽 sandbox/factory.py
 
-- [ ] Task 35: config.py 用 pydantic 严格解析（拼错字段报错）
+- [x] Task 35: config.py 用 pydantic 严格解析（拼错字段报错）
 
-- [ ] Task 36: main.py 显式装配 KGStore 注入 agent + 引入 Deps dataclass 容器
+- [x] Task 36: main.py 显式装配 KGStore 注入 agent + 引入 Deps dataclass 容器
 
-- [ ] Task 37: 删除 `/api/rag/query`（保留 `/health`）
+- [x] Task 37: 删除 `/api/rag/query`（保留 `/health`）
 
-- [ ] Task 38: rag.py 删 `_rrf_fuse` 双路 fallback，统一走 `HybridStore.search_multi`
+- [x] Task 38: rag.py 删 `_rrf_fuse` 双路 fallback，统一走 `HybridStore.search_multi`
 
-- [ ] Task 39: 删 hybrid 中 `_normalized_weights` / `_materialize_kg_only`
+- [x] Task 39: 删 hybrid 中 `_normalized_weights` / `_materialize_kg_only`
 
-- [ ] Task 40: rag.ingest 把 PG/ES/Milvus 写入收敛到 hybrid 层
+- [x] Task 40: rag.ingest 把 PG/ES/Milvus 写入收敛到 hybrid 层
 
-- [ ] Task 41: KG 写入异步线程 + panic recover
+- [x] Task 41: KG 写入异步线程 + panic recover
 
 # Task Dependencies
 

@@ -405,7 +405,33 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
     @app.get("/api/documents")
     async def documents_list():
         try:
-            return {"documents": _jsonable(agent.list_documents())}
+            docs = _jsonable(agent.list_documents())
+            store = getattr(getattr(getattr(agent, "inf", None), "repo", None), "documents", None)
+            if store is None:
+                store = getattr(getattr(inf, "repo", None), "documents", None)
+            if store is not None and hasattr(store, "get_version"):
+                enriched = []
+                for doc in docs or []:
+                    latest_metadata = {}
+                    latest_content_chars = 0
+                    latest_parser = ""
+                    try:
+                        latest_version_id = str((doc or {}).get("latest_version_id", "") or "")
+                        if latest_version_id:
+                            ver = _jsonable(store.get_version(latest_version_id))
+                            if isinstance(ver, dict):
+                                latest_metadata = ver.get("metadata") or {}
+                                latest_content_chars = len(str(ver.get("content_md", "") or ""))
+                                latest_parser = str((latest_metadata or {}).get("parser", "") or "")
+                    except Exception:
+                        latest_metadata = {}
+                    item = dict(doc or {})
+                    item["latest_metadata"] = latest_metadata
+                    item["latest_content_chars"] = latest_content_chars
+                    item["latest_parser"] = latest_parser
+                    enriched.append(item)
+                docs = enriched
+            return {"documents": docs}
         except Exception as e:
             logger.error("文档列表失败: %s", e)
             raise HTTPException(status_code=500, detail=str(e))

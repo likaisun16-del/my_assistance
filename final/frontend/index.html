@@ -813,7 +813,7 @@ body {
   50% { box-shadow: 0 6px 24px rgba(251,113,133,0.55); }
 }
 
-.input-hint { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.input-hint { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; min-height: 24px; overflow: visible; }
 .hint-chip {
   padding: 4px 12px;
   border-radius: var(--radius-pill);
@@ -1108,6 +1108,9 @@ async function uploadFile(file) {
       textChars: res.text_chars || 0,
       needsOCR: !!res.needs_ocr,
       docHash: res.doc_hash,
+      documentId: res.document && res.document.id,
+      versionId: res.version && res.version.id,
+      persisted: false,
       ts: Date.now()
     };
     uploadedDocs = uploadedDocs.filter(d => d.name !== file.name);
@@ -1133,7 +1136,9 @@ function renderDocs() {
       : '';
     const chunkLabel = d.needsOCR
       ? '需 OCR'
-      : `${d.chunks || 0} 块${d.indexed ? `/${d.indexed}` : ''}`;
+      : d.persisted
+        ? `v${d.version || 0}`
+        : `${d.chunks || 0} 块${d.indexed ? `/${d.indexed}` : ''}`;
     const title = `${d.name}${d.pages ? ` · ${d.pages} 页` : ''}${d.textChars ? ` · ${d.textChars} 字` : ''}${d.parser ? ` · ${d.parser}` : ''}`;
     return `
     <div class="doc-item">
@@ -1184,23 +1189,36 @@ async function loadLibraryDocs(e) {
 function syncUploadedDocsFromLibrary() {
   const uploads = libraryDocs
     .filter(d => d && d.source === 'user_upload')
-    .map(d => ({
-      name: d.title || d.id || '上传文档',
-      chunks: Number(d.latest_version || 0),
-      indexed: Number(d.latest_version || 0),
-      parser: '',
-      pages: 0,
-      textChars: 0,
-      needsOCR: false,
-      docHash: '',
-      ts: Date.parse(d.updated_at || d.created_at || '') || Date.now(),
-    }));
-  const byName = new Map();
-  for (const d of [...uploads, ...uploadedDocs]) {
-    if (!d || !d.name || byName.has(d.name)) continue;
-    byName.set(d.name, d);
+    .map(d => {
+      const meta = d.latest_metadata || {};
+      return {
+        name: meta.filename || d.title || d.id || '上传文档',
+        chunks: null,
+        indexed: null,
+        parser: d.latest_parser || meta.parser || '',
+        pages: Number(meta.pages || 0),
+        textChars: Number(meta.text_chars || d.latest_content_chars || 0),
+        needsOCR: false,
+        docHash: '',
+        documentId: d.id || '',
+        versionId: d.latest_version_id || '',
+        version: Number(d.latest_version || 0),
+        persisted: true,
+        ts: Date.parse(d.updated_at || d.created_at || '') || Date.now(),
+      };
+    });
+  const byKey = new Map();
+  for (const d of uploadedDocs) {
+    if (!d || !d.name) continue;
+    const existingKey = d.documentId ? `doc:${d.documentId}` : `name:${d.name}`;
+    byKey.set(existingKey, d);
   }
-  uploadedDocs = Array.from(byName.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  for (const d of uploads) {
+    if (!d || !d.name) continue;
+    const uploadKey = d.documentId ? `doc:${d.documentId}` : `name:${d.name}`;
+    byKey.set(uploadKey, d);
+  }
+  uploadedDocs = Array.from(byKey.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0));
   localStorage.setItem('ai_docs', JSON.stringify(uploadedDocs));
 }
 
@@ -1453,6 +1471,15 @@ function appendBubble(role, html, isHtml = false) {
 
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
+
+function escAttr(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 // ══════════════════════════════════════════

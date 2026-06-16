@@ -42,6 +42,11 @@ class MilvusHit:
     distance: float = 0.0
 
 
+def _is_missing_conflict_target_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "on conflict" in msg and "unique or exclusion constraint" in msg
+
+
 class Store:
     """默认实现，组合 PG / Milvus / ES 三个底层 client。"""
 
@@ -92,6 +97,40 @@ class Store:
                     "embedding = EXCLUDED.embedding "
                     "RETURNING id",
                     (doc_hash, chunk_idx, content, parent_content, emb_param),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else -1
+        except Exception as e:
+            if _is_missing_conflict_target_error(e):
+                return self._save_pg_with_parent_fallback(
+                    doc_hash, chunk_idx, content, parent_content, emb_param
+                )
+            logger.warning("⚠️  RAG chunk 保存失败: %s", e)
+            return -1
+
+    def _save_pg_with_parent_fallback(self, doc_hash: str, chunk_idx: int, content: str,
+                                      parent_content: str, embedding_json) -> int:
+        """兼容旧库唯一约束异常：不用 ON CONFLICT，显式 select/update/insert。"""
+        try:
+            with self.pg.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM rag_chunks WHERE doc_hash = %s AND chunk_idx = %s ORDER BY id LIMIT 1",
+                    (doc_hash, chunk_idx),
+                )
+                row = cur.fetchone()
+                if row:
+                    pg_id = int(row[0])
+                    cur.execute(
+                        "UPDATE rag_chunks SET content = %s, parent_content = NULLIF(%s, ''), embedding = %s "
+                        "WHERE id = %s",
+                        (content, parent_content, embedding_json, pg_id),
+                    )
+                    return pg_id
+
+                cur.execute(
+                    "INSERT INTO rag_chunks (doc_hash, chunk_idx, content, parent_content, embedding) "
+                    "VALUES (%s, %s, %s, NULLIF(%s, ''), %s) RETURNING id",
+                    (doc_hash, chunk_idx, content, parent_content, embedding_json),
                 )
                 row = cur.fetchone()
                 return int(row[0]) if row else -1

@@ -434,3 +434,45 @@ def test_save_rag_chunk_with_parent_is_idempotent_upsert():
         assert "RETURNING id" in sql
         assert params is not None and params[0] == "doc-hash-x" and params[1] == 0
 
+
+def test_save_rag_chunk_falls_back_when_conflict_target_unavailable():
+    """旧库唯一约束异常时，PG 保存应回退到 select/update/insert 路径。"""
+    from internal.repo.ragchunk import Store
+
+    executed = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+            if "ON CONFLICT" in sql:
+                raise RuntimeError("there is no unique or exclusion constraint matching the ON CONFLICT specification")
+
+        def fetchone(self):
+            if len(executed) == 2:
+                return (42,)
+            return None
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakePG:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def is_real(self):
+            return True
+
+    store = Store(FakePG(FakeConn()), None, None)
+
+    pg_id = store.save_pg_with_parent("doc-hash-y", 1, "content", "parent", "[]")
+
+    assert pg_id == 42
+    assert any("SELECT id FROM rag_chunks" in sql for sql, _ in executed)
+    assert not any("INSERT INTO rag_chunks" in sql and "ON CONFLICT" not in sql for sql, _ in executed)

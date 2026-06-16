@@ -194,6 +194,7 @@ def test_frontend_contains_local_document_library_ui():
     assert "loadLibraryDocs" in html
     assert "fetchDocumentJSON('/api/documents')" in html
     assert "/api/documents/' + encodeURIComponent(id) + '/ingest" in html
+    assert "function escAttr" in html
 
 
 def test_frontend_refreshes_library_after_document_tool_events():
@@ -212,3 +213,21 @@ def test_frontend_restores_upload_list_from_document_library():
     assert "localStorage.removeItem('ai_docs')" not in html
     assert "syncUploadedDocsFromLibrary" in html
     assert "d.source === 'user_upload'" in html
+
+
+def test_frontend_does_not_show_document_version_as_chunk_count():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "chunks: Number(d.latest_version || 0)" not in html
+    assert "indexed: Number(d.latest_version || 0)" not in html
+    assert "d.persisted" in html
+    assert "v${d.version || 0}" in html
+
+
+def test_frontend_overwrites_stale_upload_cache_from_document_library():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "const uploadKey" in html
+    assert "const existingKey" in html
+    assert "byKey.set(uploadKey, d)" in html
+    assert "byName.has(d.name)" not in html

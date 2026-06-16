@@ -9,9 +9,11 @@ logger = logging.getLogger(__name__)
 
 try:
     import psycopg2
+    from psycopg2 import pool as pg_pool
     _HAS_PG = True
 except ImportError:
     psycopg2 = None  # type: ignore
+    pg_pool = None  # type: ignore
     _HAS_PG = False
 
 
@@ -74,6 +76,7 @@ class PostgresClient:
     def __init__(self, cfg: APIConfig):
         self.cfg = cfg
         self._conn = None
+        self._pool = None
         self.status: str = "disconnected"
         self._connect()
         if self._conn is not None:
@@ -88,30 +91,51 @@ class PostgresClient:
             logger.warning("⚠️  PostgreSQL 未配置")
             return
         try:
-            self._conn = psycopg2.connect(self.cfg.pg_dsn())
-            # autocommit 简化使用；事务交给上层显式管理
+            self._pool = pg_pool.ThreadedConnectionPool(
+                5,
+                25,
+                dsn=self.cfg.pg_dsn(),
+            )
+            self._conn = self._pool.getconn()
             self._conn.autocommit = True
             with self._conn.cursor() as cur:
                 cur.execute("SELECT 1")
+            self._pool.putconn(self._conn)
+            self._conn = None
             self.status = "connected"
-            logger.info("✅ PostgreSQL 已连接: %s", self.cfg.pg_dsn())
+            logger.info("✅ PostgreSQL 连接池已连接: %s (min=5 max=25)", self.cfg.pg_dsn())
         except Exception as e:
             logger.warning("⚠️  PostgreSQL 连接失败: %s", e)
             self._conn = None
+            self._pool = None
             self.status = "disconnected"
 
     # ─── 状态判断 ───
     def is_real(self) -> bool:
         """返回是否真实连接（非 mock 模式）。"""
-        return self._conn is not None
+        return self._pool is not None or self._conn is not None
+
+    def _borrow(self):
+        if self._pool is not None:
+            conn = self._pool.getconn()
+            conn.autocommit = True
+            return conn
+        return self._conn
+
+    def _release(self, conn) -> None:
+        if self._pool is not None and conn is not None:
+            self._pool.putconn(conn)
 
     # ─── Schema bootstrap ───
     def bootstrap_schema(self) -> None:
         """幂等地创建/升级所有业务表。"""
-        if self._conn is None:
+        if not self.is_real():
+            return
+        conn = self._borrow()
+        if conn is None:
             return
         try:
-            with self._conn.cursor() as cur:
+            with conn.cursor() as cur:
                 for ddl in _DDLS:
                     try:
                         cur.execute(ddl)
@@ -120,63 +144,103 @@ class PostgresClient:
             logger.info("✅ PostgreSQL 表结构已初始化")
         except Exception as e:
             logger.warning("⚠️  PG bootstrap 失败: %s", e)
+        finally:
+            self._release(conn)
 
     # ─── 通用 query / exec ───
     def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> List[Tuple[Any, ...]]:
         """执行 SELECT，返回所有行。失败返回空列表。"""
-        if self._conn is None:
+        if not self.is_real():
+            return []
+        conn = self._borrow()
+        if conn is None:
             return []
         try:
-            with self._conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 return list(cur.fetchall())
         except Exception as e:
             logger.warning("⚠️  PG query 失败: %s", e)
             return []
+        finally:
+            self._release(conn)
 
     def query_one(self, sql: str, params: Optional[Sequence[Any]] = None) -> Optional[Tuple[Any, ...]]:
         """执行 SELECT，返回第一行（或 None）。"""
-        if self._conn is None:
+        if not self.is_real():
+            return None
+        conn = self._borrow()
+        if conn is None:
             return None
         try:
-            with self._conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 row = cur.fetchone()
                 return row
         except Exception as e:
             logger.warning("⚠️  PG query_one 失败: %s", e)
             return None
+        finally:
+            self._release(conn)
 
     def exec(self, sql: str, params: Optional[Sequence[Any]] = None) -> int:
         """执行 INSERT/UPDATE/DELETE，返回受影响行数；失败返回 -1。"""
-        if self._conn is None:
+        if not self.is_real():
+            return -1
+        conn = self._borrow()
+        if conn is None:
             return -1
         try:
-            with self._conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 return cur.rowcount
         except Exception as e:
             logger.warning("⚠️  PG exec 失败: %s", e)
             return -1
+        finally:
+            self._release(conn)
 
     def exec_many(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> int:
-        if self._conn is None:
+        if not self.is_real():
+            return -1
+        conn = self._borrow()
+        if conn is None:
             return -1
         try:
-            with self._conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.executemany(sql, list(seq_of_params))
                 return cur.rowcount
         except Exception as e:
             logger.warning("⚠️  PG exec_many 失败: %s", e)
             return -1
+        finally:
+            self._release(conn)
 
     @property
     def conn(self):
         """返回底层 psycopg2 连接，供需要更精细控制（如 RETURNING）的调用方使用。"""
+        if self._conn is None and self._pool is not None:
+            self._conn = self._pool.getconn()
+            self._conn.autocommit = True
         return self._conn
+
+    def release_conn(self) -> None:
+        if self._pool is not None and self._conn is not None:
+            self._pool.putconn(self._conn)
+            self._conn = None
 
     # ─── 关闭 ───
     def close(self) -> None:
+        if self._pool is not None:
+            try:
+                self.release_conn()
+                self._pool.closeall()
+            except Exception as e:
+                logger.warning("⚠️  PG 连接池关闭失败: %s", e)
+            finally:
+                self._pool = None
+                self.status = "disconnected"
+            return
         if self._conn is not None:
             try:
                 self._conn.close()

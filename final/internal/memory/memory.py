@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _publish_event(inf, event_type: str, payload: Dict[str, Any]) -> None:
+    try:
+        events = getattr(getattr(inf, "repo", None), "events", None)
+        if events is not None and hasattr(events, "publish"):
+            events.publish(event_type, json.dumps(payload, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("⚠️  publish_event(%s) 失败: %s", event_type, e)
+
+
 @dataclass
 class Item:
     content: str
@@ -221,6 +230,13 @@ class LongTerm:
             slot_hint=item.slot_hint,
             score=item.score,
         )
+        _publish_event(self.inf, "memory.longterm.add", {
+            "id": item.id,
+            "content": content,
+            "importance": importance,
+            "category": item.category,
+            "tags": item.tags,
+        })
 
         # 图增强记忆 hook：新增条目同步进图
         if self.graph_memory is not None:
@@ -297,6 +313,14 @@ class LongTerm:
                         self.graph_memory.update_node(target)
                     except Exception as e:
                         logger.warning("⚠️  graph_memory.update_node 失败: %s", e)
+                _publish_event(self.inf, "memory.longterm.update", {
+                    "id": target.id,
+                    "importance": target.importance,
+                    "category": target.category,
+                    "tags": target.tags,
+                    "slot_hint": target.slot_hint,
+                    "reason": "classified_dedup",
+                })
                 return False
 
         now_ts = time.time()
@@ -341,6 +365,15 @@ class LongTerm:
                 self.graph_memory.add_to_graph(new_item, neighbors=prior[-50:])
             except Exception as e:
                 logger.warning("⚠️  graph_memory.add_to_graph 失败: %s", e)
+        _publish_event(self.inf, "memory.longterm.add", {
+            "id": new_item.id,
+            "content": content,
+            "importance": importance,
+            "category": new_item.category,
+            "tags": new_item.tags,
+            "slot_hint": new_item.slot_hint,
+            "reason": "classified",
+        })
         return True
 
     def recall(self, query: str, top_k: int = 3) -> List[Item]:
@@ -737,6 +770,14 @@ class LongTerm:
             "✅ 记忆合并完成 deduped=%d merged=%d expired=%d 剩余 %d 条",
             result.deduped, result.merged, result.expired, len(self.items),
         )
+        _publish_event(self.inf, "memory.consolidate", {
+            "deduped": result.deduped,
+            "merged": result.merged,
+            "expired": result.expired,
+            "delete_from_db": list(result.delete_from_db),
+            "update_count": len(result.update_in_db),
+            "remaining": len(self.items),
+        })
         return result
 
     def _merge_pair(self, item_i: Item, item_j: Item, now: float) -> Item:

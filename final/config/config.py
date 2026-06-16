@@ -8,7 +8,64 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # 项目根目录（final/）：本文件位于 final/config/config.py
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _project_root() -> str:
+    return os.environ.get("AGI_PROJECT_ROOT", DEFAULT_PROJECT_ROOT)
+
+
+_CONFIG_SCHEMA = {
+    "llm": {"api_url", "api_key", "model", "temperature"},
+    "embedding": {"api_url", "api_key", "model"},
+    "milvus": {"host", "port"},
+    "postgres": {"host", "port", "user", "password", "database"},
+    "elasticsearch": {"addresses", "username", "password"},
+    "kafka": {"brokers", "topic"},
+    "neo4j": {"uri", "user", "password", "max_hops", "weight", "enabled"},
+    "rag": {
+        "chunk_size",
+        "chunk_overlap",
+        "top_k",
+        "rrf_constant_k",
+        "semantic_weight",
+        "enable_hybrid_search",
+        "rag_milvus_dim",
+        "rewrite",
+        "rerank",
+    },
+    "memory": {"short_term_max_turns", "long_term_top_k", "consolidation"},
+    "harness": {"max_retries", "retry_delay_ms", "step_timeout_ms", "max_iterations"},
+    "graph_runtime": {"max_parallel", "race_timeout_ms", "enable_racing"},
+    "search": {"api_key", "api_url"},
+    "server": {"port", "cors_origins"},
+    "sandbox": {
+        "enabled",
+        "backend",
+        "image",
+        "timeout_ms",
+        "max_output_bytes",
+        "memory_limit_mb",
+        "cpu_percent",
+        "max_pids",
+        "network_disabled",
+        "readonly_rootfs",
+    },
+    "security": {"max_command_length", "allowlist_mode", "allowlist"},
+}
+
+_NESTED_CONFIG_SCHEMA = {
+    ("rag", "rewrite"): {"enabled", "num_queries"},
+    ("rag", "rerank"): {"enabled", "preview_len"},
+    ("memory", "consolidation"): {
+        "similarity_threshold",
+        "dedup_threshold",
+        "ttl_days",
+        "decay_rate",
+        "min_importance",
+        "trigger_interval",
+    },
+}
 
 
 class APIConfig:
@@ -137,15 +194,39 @@ def _read_yaml(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _validate_config_schema(data: Dict[str, Any]) -> None:
+    for section, value in (data or {}).items():
+        if section not in _CONFIG_SCHEMA:
+            raise ValueError(f"unknown config field: {section}")
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"config section {section} must be a mapping")
+        allowed = _CONFIG_SCHEMA[section]
+        for key, nested in value.items():
+            if key not in allowed:
+                raise ValueError(f"unknown config field: {section}.{key}")
+            nested_allowed = _NESTED_CONFIG_SCHEMA.get((section, key))
+            if nested_allowed is None or nested is None:
+                continue
+            if not isinstance(nested, dict):
+                raise ValueError(f"config section {section}.{key} must be a mapping")
+            for nested_key in nested:
+                if nested_key not in nested_allowed:
+                    raise ValueError(f"unknown config field: {section}.{key}.{nested_key}")
+
+
 def _resolve_config_path(explicit: Optional[str]) -> str:
-    """按优先级找 config.yaml：参数 > 环境变量 > 项目根 > cwd。"""
+    """按优先级找 config：参数 > 环境变量 > 本地配置 > 项目默认 > cwd。"""
     candidates: List[str] = []
     if explicit:
         candidates.append(explicit)
     env = os.environ.get("AGI_CONFIG")
     if env:
         candidates.append(env)
-    candidates.append(os.path.join(PROJECT_ROOT, "config", "config.yaml"))
+    root = _project_root()
+    candidates.append(os.path.join(root, "config", "config.local.yaml"))
+    candidates.append(os.path.join(root, "config", "config.yaml"))
     candidates.append("config/config.yaml")
     for p in candidates:
         if p and os.path.isfile(p):
@@ -158,6 +239,7 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
     c = APIConfig()
     path = _resolve_config_path(config_path)
     data = _read_yaml(path)
+    _validate_config_schema(data)
 
     if llm := data.get("llm"):
         c.llm_api_url = llm.get("api_url", "")

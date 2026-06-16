@@ -22,6 +22,16 @@ from internal.llm.llm import Message
 logger = logging.getLogger(__name__)
 
 
+def _publish_event(agent, event_type: str, payload: Dict[str, Any]) -> None:
+    try:
+        repo = getattr(getattr(agent, "inf", None), "repo", None) or getattr(agent, "repo", None)
+        events = getattr(repo, "events", None) if repo is not None else None
+        if events is not None and hasattr(events, "publish"):
+            events.publish(event_type, json.dumps(payload, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("⚠️  publish_event(%s) 失败: %s", event_type, e)
+
+
 # ── 异步记忆写入器 ──────────────────────────────────────────────────────────
 
 class AsyncMemoryWriter:
@@ -262,6 +272,7 @@ def sync_consolidation_to_db(agent, result) -> None:
     if delete_ids:
         try:
             ltm_repo.delete(delete_ids)
+            _publish_event(agent, "memory.consolidate.delete", {"ids": delete_ids, "count": len(delete_ids)})
             logger.info("🧹 记忆合并：删除 %d 条 (ids=%s)", len(delete_ids), delete_ids)
         except Exception as e:
             logger.warning("⚠️  sync_consolidation_to_db delete 失败: %s", e)
@@ -273,6 +284,11 @@ def sync_consolidation_to_db(agent, result) -> None:
         try:
             emb_json = json.dumps(item.embedding) if item.embedding else "null"
             ltm_repo.update(int(item_id), item.content, float(item.importance), emb_json)
+            _publish_event(agent, "memory.consolidate.update", {
+                "id": int(item_id),
+                "importance": float(item.importance),
+                "content": item.content,
+            })
             logger.info("🔗 记忆合并：更新 id=%d", int(item_id))
         except Exception as e:
             logger.warning("⚠️  sync_consolidation_to_db update id=%s 失败: %s", item_id, e)
