@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from config.config import APIConfig
-from internal.repo import chathistory, eventbus, longterm, preference, ragchunk, snapshot
+from internal.repo import chathistory, documentrepo, eventbus, longterm, preference, ragchunk, snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +300,7 @@ class Infrastructure:
             chat_history=chathistory.PGRepo(pg_client),
             preference=preference.PGRepo(pg_client),
             snapshot=snapshot.PGRepo(pg_client),
+            documents=documentrepo.Store(pg_client),
             events=eventbus.KafkaPublisher(kafka_client),
         )
 
@@ -380,6 +381,28 @@ class Infrastructure:
             """ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS parent_content TEXT""",
             """CREATE UNIQUE INDEX IF NOT EXISTS rag_chunks_doc_hash_chunk_idx_key
                    ON rag_chunks (doc_hash, chunk_idx)""",
+            """CREATE TABLE IF NOT EXISTS documents (
+                id          TEXT PRIMARY KEY,
+                title       TEXT NOT NULL,
+                doc_type    TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'active',
+                created_by  TEXT NOT NULL,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS document_versions (
+                id          TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                version     INT NOT NULL,
+                content_md  TEXT NOT NULL,
+                summary     TEXT,
+                metadata    JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (document_id, version)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_documents_updated_at ON documents(updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_document_versions_document_id_version ON document_versions(document_id, version DESC)",
         ]
         with self._pg.cursor() as cur:
             for ddl in ddls:
