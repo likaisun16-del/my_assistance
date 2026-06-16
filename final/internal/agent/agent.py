@@ -62,6 +62,7 @@ from .restore import init_knowledge_graph, restore_from_db, restore_rag_from_db
 from .router import detect_tool, need_rag, need_react, need_react_from_tools, need_tool
 from .planner import llm_plan_graph
 from .status import infra_status, status as build_status
+from .subagents import register_builtin_subagents
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class UnifiedAgent:
 
         # 默认工具集；planner / sandbox 可后续追加
         self.tool_executor = ToolExecutor(default_tools(cfg=cfg, llm=self.llm))
+        self.subagents = register_builtin_subagents(self)
 
         # 注册依赖 agent 上下文的内置工具（rag_search 闭包，与 Go 版
         # registerBuiltinTools 对齐）。search_web 已在 default_tools 中

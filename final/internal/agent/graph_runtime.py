@@ -3,7 +3,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from internal.graph.task_graph import NodeStatus, TaskGraph
+from internal.agent.subagents import SubAgentTask
+from internal.graph.task_graph import NodeStatus, NodeType, TaskGraph
 from internal.promptctx import StepObservation, ToolCallTrace
 
 
@@ -108,6 +109,7 @@ class GraphRuntime:
                     done.set()
                     self.graph.set_node_result(node_id, result)
                     self._record_success(node_id, result)
+                    _cancel_token(token)
 
         threads = []
         for node_id in node_ids:
@@ -158,6 +160,9 @@ class GraphRuntime:
                 return "", "被用户中断"
 
             self.graph.set_node_status(node_id, NodeStatus.RUNNING)
+            if node.type == NodeType.SUBAGENT:
+                return self._execute_subagent_node(token, node_id, record)
+
             tool = self.tools.get(node.tool_name)
             if tool is None:
                 error = f"工具 {node.tool_name} 不在允许列表中"
@@ -189,6 +194,57 @@ class GraphRuntime:
             if record:
                 self._record_failure(node_id, last_error)
             return "", last_error
+
+    def _execute_subagent_node(self, token, node_id: str, record: bool = True):
+        node = self.graph.nodes[node_id]
+        registry = getattr(self.agent, "subagents", None)
+        subagent = registry.get(node.tool_name) if registry is not None else None
+        if subagent is None:
+            error = f"子代理 {node.tool_name} 未注册"
+            self.graph.set_node_error(node_id, error)
+            if record:
+                self._record_failure(node_id, error)
+            return "", error
+
+        upstream = {
+            dep: self.graph.nodes[dep].result
+            for dep in node.depends_on or []
+            if dep in self.graph.nodes and self.graph.nodes[dep].result
+        }
+        task = SubAgentTask(
+            id=node_id,
+            goal=str((node.params or {}).get("goal") or node.name or ""),
+            query=str(self.task.get("query") or self.task.get("message") or ""),
+            upstream=upstream,
+        )
+        try:
+            setattr(self.agent, "last_subagent_task", task)
+        except Exception:
+            pass
+
+        max_retries = max(1, int(getattr(self.agent.cfg, "max_retries", 1)))
+        retry_delay = float(getattr(self.agent.cfg, "retry_delay_ms", 0)) / 1000.0
+        last_error = ""
+        for attempt in range(max_retries):
+            if _is_cancelled(token):
+                self.graph.set_node_status(node_id, NodeStatus.CANCELLED)
+                return "", "被用户中断"
+            try:
+                result = str(subagent.run(task))
+                self.graph.set_node_result(node_id, result)
+                if record:
+                    self._record_success(node_id, result)
+                return result, None
+            except Exception as e:
+                last_error = str(e)
+                self.graph.set_node_retry_count(node_id, attempt + 1)
+                if attempt < max_retries - 1 and retry_delay > 0:
+                    time.sleep(retry_delay)
+
+        self.graph.set_node_error(node_id, last_error)
+        if record:
+            self._record_failure(node_id, last_error)
+        return "", last_error
 
     def _group_by_race(self, level: List[str]) -> List[tuple]:
         group_map: Dict[str, List[str]] = {}
@@ -260,6 +316,12 @@ def _call_tool(tool, params: Dict[str, Any]) -> str:
 
 def _is_cancelled(token) -> bool:
     return bool(token is not None and callable(getattr(token, "is_cancelled", None)) and token.is_cancelled())
+
+
+def _cancel_token(token) -> None:
+    cancel = getattr(token, "cancel", None) if token is not None else None
+    if callable(cancel):
+        cancel()
 
 
 def _node_step_id(node_id: str) -> int:
