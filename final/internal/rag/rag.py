@@ -7,6 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from config.config import APIConfig
 from internal.graph.kgstore import KGStore
+from internal.graph.types import ChunkRef
 from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient
 from internal.rag.hybrid import HybridStore
@@ -32,6 +33,9 @@ class Engine:
         self._reranker = None
         # 复用 agent 注入的 LLM 客户端，避免重复实例
         self._llm = llm if llm is not None else LLMClient(cfg)
+        # 知识图谱存储（由 restore.init_knowledge_graph 注入）。
+        # ingest 时同步写入 Neo4j，使 hybrid._fetch_kg 能搜到内容。
+        self._kg: Optional[KGStore] = None
         # 三路混合检索（Milvus + ES + KG），由 cfg.enable_hybrid_search 控制是否启用
         self._hybrid: Optional[HybridStore] = None
         if getattr(cfg, "enable_hybrid_search", False):
@@ -50,10 +54,12 @@ class Engine:
             self._hybrid.set_reranker(reranker)
 
     def set_kg_store(self, kg: Optional[KGStore]) -> None:
-        """注入知识图谱存储（图路检索的第三路）。
+        """注入知识图谱存储。
 
-        必须在 cfg.enable_hybrid_search=True 时才生效；否则仅记录但不影响单路检索。
+        Engine 自身持一份引用，用于 ingest 时同步写入 Neo4j；同时转发给 hybrid，
+        供 enable_hybrid_search=True 时的图路检索使用。
         """
+        self._kg = kg
         if self._hybrid is not None:
             self._hybrid.set_kg_store(kg)
 
@@ -82,6 +88,7 @@ class Engine:
         pg_ids: List[int] = []
         valid_contents: List[str] = []
         valid_embeddings: List[List[float]] = []
+        valid_chunk_idxs: List[int] = []
         doc_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()[:16]
         for i, chunk in enumerate(chunks):
             embedding: List[float] = []
@@ -101,6 +108,7 @@ class Engine:
                 pg_ids.append(pg_id)
                 valid_contents.append(chunk.content)
                 valid_embeddings.append(embedding)
+                valid_chunk_idxs.append(i)
                 if self.inf.ready.elasticsearch == "connected":
                     try:
                         self.inf.index_rag_chunk(pg_id, chunk.content, doc_hash, i)
@@ -122,6 +130,20 @@ class Engine:
                 self.inf.insert_rag_chunks(milvus_ids, milvus_contents, milvus_embeddings)
             except Exception as e:
                 logger.warning("⚠️  RAG chunks 写入 Milvus 失败: %s", e)
+
+        # 写入知识图谱（best-effort，不阻塞主入库流程）。
+        # 仅当 KGStore 已注入且底层 Neo4j 真实连接时执行。
+        if self._kg is not None and self._kg.available() and pg_ids:
+            try:
+                refs = [
+                    ChunkRef(id=idx, pg_id=pg_id, content=content)
+                    for idx, pg_id, content in zip(
+                        valid_chunk_idxs, pg_ids, valid_contents
+                    )
+                ]
+                self._kg.index_document(doc_hash, refs)
+            except Exception as e:
+                logger.warning("⚠️  RAG chunks 写入 Neo4j 知识图谱失败: %s", e)
 
         self.loaded = True
         self.inf.publish_event("rag.ingest", json.dumps({

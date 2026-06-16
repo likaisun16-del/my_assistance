@@ -183,6 +183,62 @@ def test_engine_ingest_saves_child_chunks_with_parent_content():
     assert all(row["parent_content"] for row in inf.saved_chunks)
 
 
+def test_engine_ingest_writes_to_kg_when_available():
+    """ingest 应在 KGStore 可用时同步把每个有效 chunk 写入 Neo4j。
+
+    回归此前的隐性 bug：KGStore.search 早已实现，但 ingest 从未触发
+    KGStore.index_document，导致 Neo4j 始终为空、_fetch_kg 永远返回空结果。
+    """
+    from internal.graph.types import ChunkRef
+
+    class _FakeKG:
+        def __init__(self, available=True):
+            self._available = available
+            self.calls = []
+
+        def available(self):
+            return self._available
+
+        def index_document(self, doc_hash, refs):
+            self.calls.append((doc_hash, list(refs)))
+
+    inf = _FakeInfra()
+    engine = Engine(_FakeCfg(), inf, _FakeLLM())
+    kg = _FakeKG(available=True)
+    engine.set_kg_store(kg)
+
+    engine.ingest("abcdefghijklmnopqrstuvwxyz")
+
+    assert len(kg.calls) == 1, "KGStore.index_document should be called exactly once"
+    doc_hash, refs = kg.calls[0]
+    assert isinstance(doc_hash, str) and len(doc_hash) == 16
+    assert refs and all(isinstance(r, ChunkRef) for r in refs)
+    assert all(r.pg_id > 0 and r.content for r in refs)
+
+
+def test_engine_ingest_skips_kg_when_unavailable():
+    """KGStore.available()=False 时不应调用 index_document，避免 Neo4j 故障阻塞主入库。"""
+
+    class _FakeKG:
+        def __init__(self):
+            self.calls = []
+
+        def available(self):
+            return False
+
+        def index_document(self, doc_hash, refs):
+            self.calls.append((doc_hash, refs))
+
+    inf = _FakeInfra()
+    engine = Engine(_FakeCfg(), inf, _FakeLLM())
+    kg = _FakeKG()
+    engine.set_kg_store(kg)
+
+    engine.ingest("abcdefghijklmnopqrstuvwxyz")
+
+    assert kg.calls == [], "KG should be skipped when not available"
+
+
 def test_engine_query_with_history_uses_rewrite_search_multi_and_parent_context():
     inf = _FakeInfra()
     engine = Engine(_FakeCfg(), inf, _FakeLLM())
