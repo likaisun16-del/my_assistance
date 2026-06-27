@@ -344,3 +344,14 @@ def test_frontend_overwrites_stale_upload_cache_from_document_library():
     assert "const existingKey" in html
     assert "byKey.set(uploadKey, d)" in html
     assert "byName.has(d.name)" not in html
+
+
+def test_frontend_uses_completion_badges_instead_of_interrupted_for_successful_done():
+    html = Path("frontend/index.html").read_text(encoding="utf-8")
+
+    assert "function markStreamCompleted" in html
+    assert "推理完成" in html
+    assert "工具调用完成" in html
+    assert "检索完成" in html
+    assert "本次回复已取消" in html
+    assert "✦ 已中断" not in html

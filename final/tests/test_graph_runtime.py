@@ -84,7 +84,7 @@ def test_graph_runtime_race_group_first_success_wins():
     assert graph.nodes["n1"].status in {NodeStatus.SKIPPED, NodeStatus.CANCELLED}
 
 
-def test_graph_runtime_race_group_cancels_shared_token_on_first_success():
+def test_graph_runtime_race_group_success_does_not_cancel_request_token():
     token = CancelToken()
     tools = {
         "slow": _Tool(lambda _params: time.sleep(0.05) or "slow"),
@@ -103,7 +103,7 @@ def test_graph_runtime_race_group_cancels_shared_token_on_first_success():
         {"task_id": "t1"},
     ).execute(token)
 
-    assert token.is_cancelled() is True
+    assert token.is_cancelled() is False
 
 
 def test_graph_runtime_retries_and_records_failure():

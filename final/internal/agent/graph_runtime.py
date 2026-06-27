@@ -109,7 +109,6 @@ class GraphRuntime:
                     done.set()
                     self.graph.set_node_result(node_id, result)
                     self._record_success(node_id, result)
-                    _cancel_token(token)
 
         threads = []
         for node_id in node_ids:
@@ -316,12 +315,6 @@ def _call_tool(tool, params: Dict[str, Any]) -> str:
 
 def _is_cancelled(token) -> bool:
     return bool(token is not None and callable(getattr(token, "is_cancelled", None)) and token.is_cancelled())
-
-
-def _cancel_token(token) -> None:
-    cancel = getattr(token, "cancel", None) if token is not None else None
-    if callable(cancel):
-        cancel()
 
 
 def _node_step_id(node_id: str) -> int:

@@ -759,6 +759,15 @@ body {
   border: 1px solid rgba(251,113,133,0.2);
 }
 
+.completion-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: var(--radius-pill);
+  background: var(--green-l); color: #059669;
+  font-size: 11px; font-weight: 600;
+  margin-bottom: 6px;
+  border: 1px solid rgba(16,185,129,0.22);
+}
+
 /* ── Input area ── */
 .input-area {
   background: var(--card);
@@ -1561,7 +1570,7 @@ function buildReply(data) {
   }
 
   if (data.interrupted) {
-    parts.push('<div class="interrupted-badge">✦ 已中断</div>');
+    parts.push('<div class="interrupted-badge">本次回复已取消</div>');
   }
 
   parts.push(`<div class="answer-text">${escHtml(data.answer || '')}</div>`);
@@ -1609,6 +1618,21 @@ function setLoadingState(loading) {
     btn.classList.remove('stop');
     btn.disabled = false;
   }
+}
+
+function markStreamCompleted(thinkWrap, mode, interrupted) {
+  if (interrupted) return;
+  const badgeEl = thinkWrap && thinkWrap.querySelector('.think-badge');
+  if (!badgeEl) return;
+  const labels = {
+    react: '推理完成',
+    tool: '工具调用完成',
+    rag: '检索完成',
+    chat: '回复完成'
+  };
+  if (!labels[mode]) return;
+  badgeEl.textContent = labels[mode];
+  badgeEl.className = 'think-badge ' + (mode === 'rag' ? 'badge-rag' : mode === 'tool' ? 'badge-tool' : 'badge-react');
 }
 
 async function send() {
@@ -1659,6 +1683,7 @@ async function send() {
   const ragEl = aiWrap.querySelector('.stream-rag');
   const answerEl = aiWrap.querySelector('.stream-answer');
   let answerText = '';
+  let currentMode = '';
 
   window._chatAbortCtrl = new AbortController();
 
@@ -1710,6 +1735,7 @@ async function send() {
 
         switch (evtName) {
           case 'route': {
+            currentMode = data.mode || '';
             const badgeEl = thinkWrap.querySelector('.think-badge');
             const modeLabels = { react:'ReAct 推理', tool:'工具调用', rag:'知识检索', chat:'对话' };
             const modeClasses = { react:'badge-react', tool:'badge-tool', rag:'badge-rag', chat:'badge-react' };
@@ -1787,7 +1813,9 @@ async function send() {
               answerEl.innerHTML = `<div class="answer-text">${escHtml(answerText)}</div>`;
             }
             if (data.interrupted) {
-              answerEl.innerHTML = `<div class="interrupted-badge">✦ 已中断</div>` + answerEl.innerHTML;
+              answerEl.innerHTML = `<div class="interrupted-badge">本次回复已取消</div>` + answerEl.innerHTML;
+            } else {
+              markStreamCompleted(thinkWrap, data.mode || currentMode, false);
             }
             maybeRefreshLibraryAfterTool(data.tool || data.tool_name || (data.task && data.task.tool_name));
             break;
@@ -1820,8 +1848,8 @@ async function send() {
     const typing = answerEl.querySelector('.typing');
     if (typing) typing.remove();
     if (e.name === 'AbortError') {
-      answerEl.innerHTML = `<div class="answer-text">✦ 已中断</div>`;
-      pushMessage('ai', '✦ 已中断');
+      answerEl.innerHTML = `<div class="answer-text">本次回复已取消</div>`;
+      pushMessage('ai', '本次回复已取消');
     } else {
       answerEl.innerHTML = `<div class="answer-text">❌ 请求失败，请检查服务是否正常运行。</div>`;
       pushMessage('ai', '❌ 请求失败');
