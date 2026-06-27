@@ -255,6 +255,13 @@ class UnifiedAgent:
         finally:
             unregister()
 
+    def process_stream(self, query: str, opts: ChatOptions, on_event) -> Response:
+        token, unregister = self._cancel_registry.register()
+        try:
+            return self._dispatch(query, opts, token, on_event)
+        finally:
+            unregister()
+
     def route(self, user_input: str, use_rag: bool = False) -> str:
         return self.process_with_options(user_input, ChatOptions(use_rag=use_rag, explicit=False)).answer
 
@@ -425,22 +432,28 @@ class UnifiedAgent:
 
     # ── 调度主循环 ─────────────────────────────────────────────────────────
 
-    def _dispatch(self, query: str, opts: ChatOptions, token) -> Response:
+    def _dispatch(self, query: str, opts: ChatOptions, token, on_event=None) -> Response:
         """三段式编排：prepare → dispatch → finalize（与 main runOnce 对齐）。"""
         pr = self._prepare(query, opts)
         resp = Response(query=query, mode=pr["mode"])
+        resp.extracted_info = pr["extracted"]
+        if resp.extracted_info:
+            _emit(on_event, "memory", {"extracted_info": resp.extracted_info})
+        _emit(on_event, "route", {"mode": resp.mode})
 
         if token.is_cancelled():
             resp.interrupted = True
             resp.answer = "[已中断] 请求在开始前被取消"
+            _emit(on_event, "done", _to_jsonable(resp))
             return resp
 
-        self._dispatch_mode(pr, resp, token)
+        self._dispatch_mode(pr, resp, token, on_event)
 
         if token.is_cancelled():
             resp.interrupted = True
 
         self._finalize(query, resp)
+        _emit(on_event, "done", _to_jsonable(resp))
         return resp
 
     # ── prepare ──────────────────────────────────────────────────────────────
@@ -489,7 +502,7 @@ class UnifiedAgent:
 
     # ── dispatch ─────────────────────────────────────────────────────────────
 
-    def _dispatch_mode(self, pr: Dict[str, Any], resp: Response, token) -> None:
+    def _dispatch_mode(self, pr: Dict[str, Any], resp: Response, token, on_event=None) -> None:
         """按 mode 分发到对应 handler，把结果填回 resp。"""
         mode = pr["mode"]
         query = pr["query"]
@@ -500,16 +513,18 @@ class UnifiedAgent:
 
         if mode == "react":
             resp.answer, resp.steps, resp.task = self._run_react_with_tools(
-                query, route_tools, mem_prefix, hist_msgs, token
+                query, route_tools, mem_prefix, hist_msgs, token, on_event
             )
         elif mode == "tool":
             resp.answer, resp.tool_call = self._run_tool_from_set(
-                query, route_tools, mem_prefix, hist_msgs
+                query, route_tools, mem_prefix, hist_msgs, token, on_event
             )
         elif mode == "rag":
             resp.answer, resp.search_results = self._run_rag_query(query)
+            _emit(on_event, "rag_result", {"search_results": resp.search_results})
+            _emit(on_event, "token", {"content": resp.answer})
         else:
-            resp.answer = self._chat_response(mem_prefix, hist_msgs)
+            resp.answer = self._chat_response(mem_prefix, hist_msgs, token, on_event)
 
     # ── finalize ─────────────────────────────────────────────────────────────
 
@@ -643,11 +658,21 @@ class UnifiedAgent:
             msgs.append(Message(role="user", content=query))
         return msgs
 
-    def _chat_response(self, mem_prefix: str, hist_msgs: List[Message]) -> str:
+    def _chat_response(self, mem_prefix: str, hist_msgs: List[Message], token=None, on_event=None) -> str:
         system_prompt = "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。"
         if mem_prefix:
             system_prompt = mem_prefix + "\n\n" + system_prompt
-        return self.llm.chat(hist_msgs, system_prompt=system_prompt)
+        return self._chat_llm(system_prompt, hist_msgs, token, on_event)
+
+    def _chat_llm(self, system_prompt: str, messages: List[Message], token=None, on_event=None) -> str:
+        if on_event is None:
+            return self.llm.chat(messages, system_prompt=system_prompt)
+        return self.llm.chat_stream_context(
+            token,
+            system_prompt,
+            messages,
+            on_token=lambda content: _emit(on_event, "token", {"content": content}),
+        )
 
     # ── 工具调用（tool 模式） ──────────────────────────────────────────────
 
@@ -700,10 +725,10 @@ class UnifiedAgent:
                 if existing is None or str(existing) == "":
                     params[name] = value
 
-    def _run_tool_from_set(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message]):
+    def _run_tool_from_set(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token=None, on_event=None):
         tool_name = detect_tool(query, tools_map)
         if not tool_name:
-            return self._chat_response(mem_prefix, hist_msgs), None
+            return self._chat_response(mem_prefix, hist_msgs, token, on_event), None
         params = self._parse_tool_params(tool_name, query)
         # 偏好补全：在 tool_executor.call 之前注入偏好（对应 Go 版 fillParamsFromPreference）
         self._fill_params_from_preference(params)
@@ -716,11 +741,18 @@ class UnifiedAgent:
             "success": result.success,
             "error": result.error,
         }
+        _emit(on_event, "tool_call", tool_call)
+        if result.success:
+            system_prompt = "你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。"
+            if mem_prefix:
+                system_prompt = mem_prefix + "\n\n" + system_prompt
+            user_msg = f"用户问：{query}\n工具 {tool_name} 返回结果：{result.content}\n请根据结果自然地回答用户。"
+            answer = self._chat_llm(system_prompt, [Message(role="user", content=user_msg)], token, on_event)
         return answer, tool_call
 
     # ── 图调度（统一 react 入口） ──────────────────────────────────────────
 
-    def _run_react_with_tools(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token):
+    def _run_react_with_tools(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token, on_event=None):
         """ReAct 模式入口：与 main 分支 runReAct 行为一致。
 
         - llm_plan_graph 拿到节点列表；
@@ -734,7 +766,7 @@ class UnifiedAgent:
             plan_nodes = llm_plan_graph(self, query, tools_map, mem_prefix)
             if not plan_nodes:
                 # 与 Go runReAct: planNodes 空 → chatLLM 一句话答复
-                return self._chat_response(mem_prefix, hist_msgs), [], task
+                return self._chat_response(mem_prefix, hist_msgs, token, on_event), [], task
 
             from internal.graph.task_graph import TaskGraph
 
@@ -760,7 +792,7 @@ class UnifiedAgent:
                 )
                 for node in graph.nodes.values()
             ]
-            final_answer = self._generate_final_answer(query, steps, mem_prefix)
+            final_answer = self._generate_final_answer(query, steps, mem_prefix, token, on_event)
             steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
             task["status"] = "interrupted" if result.interrupted else "completed"
             task["graph"] = {
@@ -779,7 +811,7 @@ class UnifiedAgent:
         finally:
             self._cancel_registry.set_task(None)
 
-    def _generate_final_answer(self, query: str, steps: List[ReActStep], mem_prefix: str) -> str:
+    def _generate_final_answer(self, query: str, steps: List[ReActStep], mem_prefix: str, token=None, on_event=None) -> str:
         steps_str = "\n".join(f"{s.type}: {s.content}" for s in steps)
         prompt = f"""基于以下推理过程，给出最终答案。
 
@@ -794,7 +826,7 @@ class UnifiedAgent:
 请用自然语言总结最终答案，不要包含 Action/Final 等关键字。
 """
         messages = [Message(role="user", content=prompt)]
-        return self.llm.chat(messages, system_prompt="你是一个总结助手，能够基于推理过程给出简洁的最终答案。")
+        return self._chat_llm("你是一个总结助手，能够基于推理过程给出简洁的最终答案。", messages, token, on_event)
 
     def _save_agent_snapshot(self, query: str, resp: Response):
         """每 N 轮把 agent 整体状态序列化到 PG（含路由 mode/计数/偏好）。"""
@@ -848,6 +880,12 @@ def _param_bool(params: Dict[str, Any], key: str) -> bool:
 
 def _json_string(value: Any) -> str:
     return json.dumps(_to_jsonable(value), ensure_ascii=False, indent=2)
+
+
+def _emit(on_event, event_type: str, data: Any) -> None:
+    if on_event is None:
+        return
+    on_event({"type": event_type, "data": _to_jsonable(data)})
 
 
 def _to_jsonable(value: Any) -> Any:

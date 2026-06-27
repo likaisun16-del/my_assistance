@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,39 @@ class _Agent:
         return "知识库回答:" + question, [{"content": "片段", "score": 0.8, "source": "test"}]
 
 
+class _StreamAgent(_Agent):
+    def __init__(self):
+        super().__init__()
+        self.process_with_options_called = False
+        self.process_stream_called = False
+
+    def process_with_options(self, message, _opts):
+        self.process_with_options_called = True
+        return Response(query=message, answer="同步回答不应被拆字", mode="chat")
+
+    def process_stream(self, message, _opts, on_event):
+        self.process_stream_called = True
+        on_event({"type": "route", "data": {"mode": "chat"}})
+        on_event({"type": "token", "data": {"content": "真"}})
+        on_event({"type": "token", "data": {"content": "流"}})
+        return Response(query=message, answer="真流", mode="chat")
+
+
+class _BlockingStreamAgent(_Agent):
+    def __init__(self):
+        super().__init__()
+        self.first_token_emitted = threading.Event()
+        self.release = threading.Event()
+
+    def process_stream(self, message, _opts, on_event):
+        on_event({"type": "route", "data": {"mode": "chat"}})
+        on_event({"type": "token", "data": {"content": "first"}})
+        self.first_token_emitted.set()
+        self.release.wait(timeout=2)
+        on_event({"type": "token", "data": {"content": "second"}})
+        return Response(query=message, answer="firstsecond", mode="chat")
+
+
 class _SnapshotRepo:
     def list(self, limit=50):
         return []
@@ -82,6 +116,13 @@ def _client():
     return setup_routes(_Agent(), _Infra(), cfg)
 
 
+def _client_for(agent):
+    cfg = APIConfig()
+    cfg.llm_model = "llm"
+    cfg.embedding_model = "embedding"
+    return setup_routes(agent, _Infra(), cfg)
+
+
 class _LegacyUploadAgent(_Agent):
     def rag_ingest(self, document):
         self.uploaded = document
@@ -115,10 +156,10 @@ def _request(app, method, path, body=b"", content_type="application/json"):
 
         async def receive():
             nonlocal sent
-            if sent:
-                return {"type": "http.disconnect"}
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await asyncio.Event().wait()
 
         async def send(message):
             messages.append(message)
@@ -173,6 +214,78 @@ def test_chat_stream_emits_sse_events_for_main_frontend():
     assert "event: route" in body
     assert "event: token" in body
     assert "event: done" in body
+
+
+def test_chat_stream_uses_agent_stream_callback_instead_of_splitting_answer():
+    agent = _StreamAgent()
+    status, payload = _request(_client_for(agent), "POST", "/api/chat/stream", json.dumps({"message": "你好"}).encode())
+    body = payload.decode("utf-8")
+
+    assert status == 200
+    assert agent.process_stream_called is True
+    assert agent.process_with_options_called is False
+    assert 'data: {"content": "真"}' in body
+    assert 'data: {"content": "流"}' in body
+    assert "同步回答不应被拆字" not in body
+
+
+def test_chat_stream_flushes_agent_events_before_stream_finishes():
+    agent = _BlockingStreamAgent()
+    app = _client_for(agent)
+    messages = []
+
+    async def _run():
+        sent = False
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "path": "/api/chat/stream",
+            "raw_path": b"/api/chat/stream",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("test", 1),
+            "server": ("testserver", 80),
+            "scheme": "http",
+        }
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": json.dumps({"message": "hi"}).encode(), "more_body": False}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+
+    error = []
+
+    def _serve():
+        try:
+            asyncio.run(_run())
+        except BaseException as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    try:
+        assert agent.first_token_emitted.wait(timeout=1)
+        for _ in range(20):
+            if any(b"first" in m.get("body", b"") for m in messages if m["type"] == "http.response.body"):
+                break
+            threading.Event().wait(0.01)
+        else:
+            raise AssertionError("first token was not flushed before process_stream returned")
+    finally:
+        agent.release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert error == []
 
 
 def test_legacy_rag_query_route_removed_to_match_main_branch():

@@ -1,8 +1,11 @@
 # handler — HTTP API 路由处理（FastAPI + Pydantic + CORS）
+import asyncio
 import logging
 import os
 import hashlib
 import json
+import queue
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -204,16 +207,7 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
 
     @app.post("/api/chat/stream")
     async def chat_stream(req: ChatRequest):
-        """SSE 流式：复用 agent 跑完元信息 + answer，再用后台线程把 answer
-        按 token 推送到 queue，主协程从 queue 取并实时 yield，结尾追加
-        ``data: [DONE]``。
-
-        cancel：注册到 agent._cancel_registry 的 token，``/api/chat/cancel`` 触发后
-        本路由的 token.is_cancelled() 立即生效，循环退出。
-        LLM 真流式接口位于 ``llm.chat_stream_context``，由独立单测覆盖；本路由
-        受任务约束（不重构 agent.py）暂不直接调用，避免与 _dispatch 中的 LLM
-        生成 / stm 写入产生重复副作用。
-        """
+        """SSE 流式：handler 只负责输出事件，真实 token 由 agent 内部 LLM 流式回调产生。"""
 
         opts = ChatOptions(
             use_rag=req.use_rag,
@@ -231,6 +225,37 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
         async def _generate():
             yield _sse("start", {"message": req.message})
             try:
+                if hasattr(agent, "process_stream"):
+                    events = queue.Queue()
+                    sentinel = object()
+
+                    def _on_event(evt):
+                        if not isinstance(evt, dict):
+                            evt = _jsonable(evt)
+                        event_type = str((evt or {}).get("type", "") or "")
+                        data = (evt or {}).get("data") or {}
+                        if event_type:
+                            events.put(_sse(event_type, data))
+
+                    def _run_process_stream():
+                        try:
+                            agent.process_stream(req.message, opts, _on_event)
+                        except Exception as e:
+                            logger.error("流式聊天 process_stream 失败: %s", e)
+                            events.put(_sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False}))
+                        finally:
+                            events.put(sentinel)
+
+                    worker = threading.Thread(target=_run_process_stream, name="chat-stream", daemon=True)
+                    worker.start()
+                    while True:
+                        item = await asyncio.to_thread(events.get)
+                        if item is sentinel:
+                            break
+                        yield item
+                    yield "data: [DONE]\n\n"
+                    return
+
                 try:
                     if hasattr(agent, "_dispatch") and registry is not None:
                         resp = agent._dispatch(req.message, opts, token)
