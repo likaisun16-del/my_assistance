@@ -88,3 +88,19 @@ def test_store_classified_without_embedding_skips_dedup():
     assert len(ltm.items) == 2
     assert len(repo.saves) == 2
     assert repo.updates == []
+
+
+def test_mark_superseded_marks_existing_conflicting_memory():
+    ltm, _repo = _make_ltm()
+    assert ltm.store_classified("用户姓名: 张三", 0.7, [1.0, 0.0], "identity", ["name"], "profile") is True
+    assert ltm.store_classified("用户姓名: 李四", 0.7, [0.7, 0.7], "identity", ["name"], "profile") is True
+
+    old_id = ltm.items[0].id
+    new_id = ltm.items[1].id
+    marked = ltm.mark_superseded([old_id], new_id)
+
+    assert marked == [old_id]
+    assert ltm.items[0].status == "superseded"
+    assert ltm.items[0].superseded_by == new_id
+    assert ltm.items[1].status == "active"
+    assert [item.content for item in ltm.active_items()] == ["用户姓名: 李四"]

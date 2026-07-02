@@ -41,6 +41,9 @@ class Item:
     tags: List[str] = field(default_factory=list)
     slot_hint: str = ""
     score: float = 0.0
+    status: str = "active"
+    superseded_by: Optional[int] = None
+    quarantine_reason: str = ""
 
 
 @dataclass
@@ -142,6 +145,23 @@ class LongTerm:
         # consolidate 阶段保护 self.items 的可重入锁
         self._lock = threading.RLock()
 
+    def _copy_item(self, item: Item, score: Optional[float] = None) -> Item:
+        return Item(
+            content=item.content,
+            importance=item.importance,
+            embedding=list(item.embedding) if item.embedding else None,
+            id=item.id,
+            created_at=item.created_at,
+            last_accessed=item.last_accessed,
+            category=item.category,
+            tags=list(item.tags),
+            slot_hint=item.slot_hint,
+            score=item.score if score is None else score,
+            status=item.status,
+            superseded_by=item.superseded_by,
+            quarantine_reason=item.quarantine_reason,
+        )
+
     def set_embed_fn(self, fn):
         self._embed_fn = fn
 
@@ -183,6 +203,9 @@ class LongTerm:
                 tags=list(getattr(r, "tags", []) or []),
                 slot_hint=getattr(r, "slot_hint", "") or "",
                 score=float(getattr(r, "score", 0.0) or 0.0),
+                status=getattr(r, "status", "") or "active",
+                superseded_by=getattr(r, "superseded_by", None),
+                quarantine_reason=getattr(r, "quarantine_reason", "") or "",
             ))
         # 重建 id 序列，确保后续 add 不与已有 item 冲突
         for idx, item in enumerate(self.items):
@@ -272,6 +295,8 @@ class LongTerm:
             best_idx = -1
             best_sim = -1.0
             for idx, existing in enumerate(self.items):
+                if existing.status != "active":
+                    continue
                 if not existing.embedding or len(existing.embedding) != len(emb):
                     continue
                 sim = self._cosine_similarity(emb, existing.embedding)
@@ -377,7 +402,8 @@ class LongTerm:
         return True
 
     def recall(self, query: str, top_k: int = 3) -> List[Item]:
-        if not self.items:
+        active = [item for item in self.items if item.status == "active"]
+        if not active:
             return []
 
         query_emb = None
@@ -389,17 +415,17 @@ class LongTerm:
                 query_emb = None
 
         if not query_emb:
-            return self.items[:top_k]
+            return [self._copy_item(item) for item in active[:top_k]]
 
         scored: List[tuple] = []
-        for item in self.items:
+        for item in active:
             if item.embedding:
                 sim = self._cosine_similarity(query_emb, item.embedding)
                 score = sim * 0.7 + item.importance * 0.3
                 scored.append((item, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [item for item, score in scored[:top_k] if score >= 0.4]
+        return [self._copy_item(item, score=score) for item, score in scored[:top_k] if score >= 0.4]
 
     def recall_by_filter(
         self,
@@ -419,7 +445,8 @@ class LongTerm:
         最后按 score desc 排序，可选按 top_k 截断。
         """
         with self._lock:
-            if not self.items:
+            active = [item for item in self.items if item.status == "active"]
+            if not active:
                 return []
 
             min_score = float(getattr(filter, "min_score", 0.0) or 0.0)
@@ -439,7 +466,7 @@ class LongTerm:
                 query_tokens = _tokenize_zh(query)
 
             candidates: List[Item] = []
-            for item in self.items:
+            for item in active:
                 # categories：命中其一
                 if cat_set is not None:
                     item_cat = item.category or "general"
@@ -473,19 +500,7 @@ class LongTerm:
 
                 # 命中：回写 last_accessed，并产出 Item 副本（设置 score 字段）
                 item.last_accessed = now
-                copy = Item(
-                    content=item.content,
-                    importance=item.importance,
-                    embedding=list(item.embedding) if item.embedding else None,
-                    id=item.id,
-                    created_at=item.created_at,
-                    last_accessed=item.last_accessed,
-                    category=item.category,
-                    tags=list(item.tags),
-                    slot_hint=item.slot_hint,
-                    score=score,
-                )
-                candidates.append(copy)
+                candidates.append(self._copy_item(item, score=score))
 
             candidates.sort(key=lambda it: it.score, reverse=True)
             if top_k > 0 and len(candidates) > top_k:
@@ -526,11 +541,32 @@ class LongTerm:
             cats = set(categories)
             result: List[Item] = []
             for it in self.items:
-                if it.category in cats:
-                    result.append(it)
+                if it.status == "active" and it.category in cats:
+                    result.append(self._copy_item(it))
                     if limit > 0 and len(result) >= limit:
-                        break
+                            break
             return result
+
+    def mark_superseded(self, old_ids: List[int], new_id: int) -> List[int]:
+        """把被新事实取代的旧长期记忆标记为 superseded。
+
+        这一步不物理删除旧记忆，方便审计和后续同步；默认 recall / filter
+        只返回 active 条目，所以已取代事实不会继续进入提示词。
+        """
+        with self._lock:
+            marked: List[int] = []
+            old_set = {int(x) for x in old_ids if x is not None}
+            for item in self.items:
+                if item.id in old_set and item.status == "active":
+                    item.status = "superseded"
+                    item.superseded_by = int(new_id) if new_id is not None else None
+                    marked.append(item.id)
+            return marked
+
+    def active_items(self) -> List[Item]:
+        """返回 active 状态的长期记忆副本。"""
+        with self._lock:
+            return [self._copy_item(item) for item in self.items if item.status == "active"]
 
     def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
         if len(a) != len(b):
@@ -555,42 +591,14 @@ class LongTerm:
         Item 内嵌的 list 字段。
         """
         with self._lock:
-            return [
-                Item(
-                    content=it.content,
-                    importance=it.importance,
-                    embedding=it.embedding,
-                    id=it.id,
-                    created_at=it.created_at,
-                    last_accessed=it.last_accessed,
-                    category=it.category,
-                    tags=it.tags,
-                    slot_hint=it.slot_hint,
-                    score=it.score,
-                )
-                for it in self.items
-            ]
+            return [self._copy_item(it) for it in self.items]
 
     def find_by_id(self, item_id: int):
         """按 id 线性查找；命中返回 (Item 值拷贝, True)，否则 (None, False)。"""
         with self._lock:
             for it in self.items:
                 if it.id == item_id:
-                    return (
-                        Item(
-                            content=it.content,
-                            importance=it.importance,
-                            embedding=it.embedding,
-                            id=it.id,
-                            created_at=it.created_at,
-                            last_accessed=it.last_accessed,
-                            category=it.category,
-                            tags=it.tags,
-                            slot_hint=it.slot_hint,
-                            score=it.score,
-                        ),
-                        True,
-                    )
+                    return (self._copy_item(it), True)
         return None, False
 
     def last_id(self) -> int:
@@ -607,21 +615,7 @@ class LongTerm:
             if not self.items:
                 return None, False
             it = self.items[-1]
-            return (
-                Item(
-                    content=it.content,
-                    importance=it.importance,
-                    embedding=it.embedding,
-                    id=it.id,
-                    created_at=it.created_at,
-                    last_accessed=it.last_accessed,
-                    category=it.category,
-                    tags=it.tags,
-                    slot_hint=it.slot_hint,
-                    score=it.score,
-                ),
-                True,
-            )
+            return (self._copy_item(it), True)
 
     def sync_last_item_pg_id(self, pg_id: int) -> None:
         """把最后一条 item 的 id 改写为 PG 真实主键，并推高 _next_id。
@@ -824,6 +818,9 @@ class LongTerm:
             tags=tags,
             slot_hint=slot_hint,
             score=item_i.score,
+            status=item_i.status,
+            superseded_by=item_i.superseded_by,
+            quarantine_reason=item_i.quarantine_reason,
         )
 
     def _compute_similarity(
@@ -971,21 +968,11 @@ class MemoryManager:
         for it in self.long_term.items:
             if it.id is None or it.id not in expanded_ids or it.id in seed_id_set:
                 continue
+            if it.status != "active":
+                continue
             if cat_set is not None and it.category not in cat_set:
                 continue
-            extra = Item(
-                content=it.content,
-                importance=it.importance,
-                embedding=list(it.embedding) if it.embedding else None,
-                id=it.id,
-                created_at=it.created_at,
-                last_accessed=it.last_accessed,
-                category=it.category,
-                tags=list(it.tags),
-                slot_hint=it.slot_hint,
-                score=0.45,
-            )
-            extras.append(extra)
+            extras.append(self.long_term._copy_item(it, score=0.45))
 
         all_items = list(seed) + extras
         all_items.sort(key=lambda x: x.score, reverse=True)

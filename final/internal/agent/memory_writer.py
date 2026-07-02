@@ -15,6 +15,7 @@ import logging
 import queue
 import re
 import threading
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from internal.llm.llm import Message
@@ -80,6 +81,101 @@ class AsyncMemoryWriter:
 # ── 公共工具 ───────────────────────────────────────────────────────────────
 
 
+@dataclass
+class MemoryInspection:
+    risk: str = "safe"
+    reason: str = ""
+    matched: str = ""
+
+    @property
+    def safe(self) -> bool:
+        return self.risk == "safe"
+
+
+_PII_PATTERNS = [
+    ("password_keyword", re.compile(r"(密\s*码|password|passwd|passphrase)\s*(是|为|=|:)\s*\S{3,}", re.I)),
+    ("api_key", re.compile(r"(api[\s_\-]?key|access[\s_\-]?key|secret[\s_\-]?key)\s*(是|为|=|:)\s*\S{6,}", re.I)),
+    ("token", re.compile(r"(bearer|jwt|access[\s_\-]?token|refresh[\s_\-]?token)\s*(是|为|=|:)?\s*[\w\-\.]{20,}", re.I)),
+    ("private_key_block", re.compile(r"-----BEGIN\s+(RSA|OPENSSH|DSA|EC|PRIVATE)\s+PRIVATE\s+KEY-----", re.I)),
+    ("id_card_cn", re.compile(r"\b\d{17}[\dXx]\b")),
+    ("credit_card", re.compile(r"\b(?:\d[ -]*?){13,19}\b")),
+    ("aws_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,255}")),
+]
+
+
+_INJECTION_PATTERNS = [
+    ("ignore_previous", re.compile(r"(忽略|无视|disregard|ignore)\s*(之前|前面|所有|previous|all\s+prior|above)\s*(指令|内容|规则|instructions?|rules?)?", re.I)),
+    ("role_override_zh", re.compile(r"你\s*(现在|从现在起|从此|以后)\s*(是|扮演|作为|当)")),
+    ("role_override_en", re.compile(r"you\s+are\s+now\s+(a|an|the)\s+", re.I)),
+    ("system_role_inject", re.compile(r"^\s*(system|assistant|user)\s*[:：]\s*", re.I)),
+    ("jailbreak_prompt", re.compile(r"(DAN|do\s+anything\s+now|developer\s+mode|越狱)", re.I)),
+    ("persistent_command", re.compile(r"(永远|从今以后|每次|总是|always|forever|from\s+now\s+on)\s*(回复|回答|说|拒绝|reply|answer|say|refuse)", re.I)),
+    ("memory_injection", re.compile(r"(请\s*)?(记住|牢记|永远记住|remember\s+(this|that|always))[：:、，,]", re.I)),
+]
+
+
+_EPHEMERAL_PATTERNS = [
+    ("now_words", re.compile(r"(今天|今晚|刚才|这次|此刻|现在|马上|稍后|just\s+now|right\s+now|today|tonight)", re.I)),
+    ("weather_smalltalk", re.compile(r"(天气|温度|气温).{0,10}(怎么样|如何|不错|很好|很差)")),
+]
+
+
+_BIOGRAPHY_KEYS = {
+    "姓名", "名字", "本名", "身份", "职业", "出生年份", "出生日期", "出生地",
+    "出道时间", "首张专辑", "代表作", "代表作品", "奖项", "称号",
+}
+
+
+def _match_any(content: str, patterns) -> MemoryInspection:
+    for name, pattern in patterns:
+        match = pattern.search(content)
+        if not match:
+            continue
+        snippet = match.group(0)
+        if len(snippet) > 40:
+            snippet = snippet[:40] + "..."
+        return MemoryInspection(reason=name, matched=snippet)
+    return MemoryInspection()
+
+
+def inspect_memory_content(content: str) -> MemoryInspection:
+    text = str(content or "").strip()
+    if not text:
+        return MemoryInspection()
+    hit = _match_any(text, _PII_PATTERNS)
+    if hit.reason:
+        hit.risk = "pii"
+        return hit
+    hit = _match_any(text, _INJECTION_PATTERNS)
+    if hit.reason:
+        hit.risk = "injection"
+        return hit
+    hit = _match_any(text, _EPHEMERAL_PATTERNS)
+    if hit.reason:
+        hit.risk = "ephemeral"
+        return hit
+    return MemoryInspection()
+
+
+def inspect_kv_pair(key: str, value: str) -> MemoryInspection:
+    for text in (f"{key}={value}", str(key or ""), str(value or "")):
+        hit = inspect_memory_content(text)
+        if not hit.safe:
+            return hit
+    return MemoryInspection()
+
+
+def _looks_like_third_party_biography(answer: str, kvs: Dict[str, Any]) -> bool:
+    text = str(answer or "")
+    if not kvs:
+        return False
+    if ("你知道" in text or "他是" in text or "她是" in text or "出生" in text or "代表作" in text) and not re.search(r"(用户|你|您|我)\s*(叫|是|喜欢|出生|来自|在)", text):
+        keys = {str(k) for k in kvs.keys()}
+        return bool(keys & _BIOGRAPHY_KEYS)
+    return False
+
+
 def _strip_code_fence(raw: str) -> str:
     raw = (raw or "").strip()
     raw = re.sub(r"^```json", "", raw)
@@ -138,9 +234,21 @@ def extract_memory_from_reply(agent, answer: str):
         return
     if not isinstance(kvs, dict) or not kvs:
         return
+    if _looks_like_third_party_biography(answer, kvs):
+        logger.info("🛡️  跳过疑似第三方百科记忆抽取，避免写入用户画像")
+        return
 
     for k, v in kvs.items():
         if not k or v in (None, ""):
+            continue
+        inspection = inspect_kv_pair(str(k), str(v))
+        if not inspection.safe:
+            logger.info(
+                "🛡️  跳过不安全记忆候选 risk=%s reason=%s matched=%s",
+                inspection.risk,
+                inspection.reason,
+                inspection.matched,
+            )
             continue
         try:
             agent.preference.set(str(k), str(v))
@@ -148,6 +256,15 @@ def extract_memory_from_reply(agent, answer: str):
             pass
 
         content = f"用户{k}: {v}"
+        inspection = inspect_memory_content(content)
+        if not inspection.safe:
+            logger.info(
+                "🛡️  跳过不安全记忆内容 risk=%s reason=%s matched=%s",
+                inspection.risk,
+                inspection.reason,
+                inspection.matched,
+            )
+            continue
         category, tags, slot_hint = classify_memory_content(str(k), str(v))
         if not category:
             category, tags, slot_hint = llm_classify_memory(agent, content)
