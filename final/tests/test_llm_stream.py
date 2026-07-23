@@ -126,6 +126,7 @@ def test_chat_stream_context_parses_openai_sse(monkeypatch):
     assert captured["payload"]["messages"][1] == {"role": "user", "content": "hi"}
     assert captured["timeout"] == (10, 120)
     assert captured["auth"] == "Bearer fake-key"
+    assert fake_resp.encoding == "utf-8"
     assert _FakeSession.last is not None and _FakeSession.last.closed is True
 
 

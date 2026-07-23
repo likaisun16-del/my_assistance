@@ -89,3 +89,35 @@ def test_default_config_prefers_local_config(monkeypatch, tmp_path):
     cfg = default_config()
 
     assert cfg.server_port == "9001"
+
+
+def test_connection_environment_overrides_support_compose_services(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+milvus:
+  host: localhost
+postgres:
+  host: localhost
+elasticsearch:
+  addresses: [http://localhost:9200]
+kafka:
+  brokers: [localhost:29092]
+neo4j:
+  uri: bolt://localhost:7687
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGI_MILVUS_HOST", "milvus")
+    monkeypatch.setenv("AGI_POSTGRES_HOST", "postgres")
+    monkeypatch.setenv("AGI_ES_ADDRESSES", "http://elasticsearch:9200")
+    monkeypatch.setenv("AGI_KAFKA_BROKERS", "kafka:9092")
+    monkeypatch.setenv("AGI_NEO4J_URI", "bolt://neo4j:7687")
+
+    cfg = default_config(str(config_path))
+
+    assert cfg.milvus_host == "milvus"
+    assert cfg.pg_host == "postgres"
+    assert cfg.es_addresses == ["http://elasticsearch:9200"]
+    assert cfg.kafka_brokers == ["kafka:9092"]
+    assert cfg.neo4j_uri == "bolt://neo4j:7687"

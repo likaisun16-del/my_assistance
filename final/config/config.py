@@ -342,8 +342,24 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.sec_allowlist_mode = bool(sec.get("allowlist_mode", False))
         c.sec_allowlist = sec.get("allowlist", []) or []
 
+    _apply_connection_overrides(c)
     _apply_defaults(c)
     return c
+
+
+def _apply_connection_overrides(c: APIConfig) -> None:
+    """允许容器通过环境变量改写依赖地址，同时保留本地配置默认值。"""
+    c.milvus_host = os.environ.get("AGI_MILVUS_HOST", c.milvus_host)
+    c.pg_host = os.environ.get("AGI_POSTGRES_HOST", c.pg_host)
+    c.neo4j_uri = os.environ.get("AGI_NEO4J_URI", c.neo4j_uri)
+
+    es_addresses = os.environ.get("AGI_ES_ADDRESSES")
+    if es_addresses:
+        c.es_addresses = [address.strip() for address in es_addresses.split(",") if address.strip()]
+
+    kafka_brokers = os.environ.get("AGI_KAFKA_BROKERS")
+    if kafka_brokers:
+        c.kafka_brokers = [broker.strip() for broker in kafka_brokers.split(",") if broker.strip()]
 
 
 def _apply_defaults(c: APIConfig) -> None:

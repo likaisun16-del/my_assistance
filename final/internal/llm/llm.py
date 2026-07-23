@@ -143,6 +143,9 @@ class Client:
                     pass
                 raise RuntimeError(f"API 返回错误状态 {resp.status_code}, body: {body}")
 
+            # 部分 OpenAI 兼容 SSE 响应未声明 charset；requests 会因此按
+            # ISO-8859-1 解码，导致中文 token 在转发到前端前就变成乱码。
+            resp.encoding = "utf-8"
             for raw in resp.iter_lines(decode_unicode=True):
                 if raw is None:
                     continue
