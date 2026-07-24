@@ -156,7 +156,6 @@ services:
       neo4j:
         condition: service_started
     environment:
-      AGI_CONFIG: /app/config/config.yaml
       FRONTEND_DIR: /app/frontend
       AGI_MILVUS_HOST: milvus
       AGI_POSTGRES_HOST: postgres
@@ -166,7 +165,7 @@ services:
     ports:
       - "8090:8090"
     volumes:
-      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./config:/app/config:ro
 
 volumes:
   postgres_data:

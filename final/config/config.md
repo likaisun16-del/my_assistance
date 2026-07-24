@@ -1,6 +1,6 @@
 # 火山方舟 API 协议参考（与本项目对齐的接口示例）
 
-> 真实 API Key 不要提交到仓库；生产请用 `config/config.local.yaml`、环境变量或密钥管理服务。
+> 真实 API Key 不要提交到仓库。请将密钥放在 `config/config.local.yaml`；应用会先读取 `config.yaml`，再只在本机叠加该文件。Docker Compose 也会自动挂载该本地文件所在的 `config` 目录。
 > 占位符：`$ARK_API_KEY`
 
 ## 多模态向量化

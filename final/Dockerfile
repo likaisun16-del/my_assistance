@@ -26,8 +26,7 @@ COPY internal/ ./internal/
 COPY main.py ./
 COPY frontend/ ./frontend/
 
-ENV FRONTEND_DIR=/app/frontend \
-    AGI_CONFIG=/app/config/config.yaml
+ENV FRONTEND_DIR=/app/frontend
 
 EXPOSE 8090
 

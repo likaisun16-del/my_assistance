@@ -71,7 +71,7 @@ rag:
         default_config(str(config_path))
 
 
-def test_default_config_prefers_local_config(monkeypatch, tmp_path):
+def test_default_config_merges_local_config(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     config_dir = project_root / "config"
     config_dir.mkdir(parents=True)
@@ -80,7 +80,12 @@ def test_default_config_prefers_local_config(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     (config_dir / "config.local.yaml").write_text(
-        "server:\n  port: 9001\n",
+        """
+llm:
+  api_key: local-llm-key
+server:
+  port: 9001
+""",
         encoding="utf-8",
     )
 
@@ -89,6 +94,7 @@ def test_default_config_prefers_local_config(monkeypatch, tmp_path):
     cfg = default_config()
 
     assert cfg.server_port == "9001"
+    assert cfg.llm_api_key == "local-llm-key"
 
 
 def test_connection_environment_overrides_support_compose_services(monkeypatch, tmp_path):

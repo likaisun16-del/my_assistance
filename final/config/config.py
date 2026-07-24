@@ -217,7 +217,7 @@ def _validate_config_schema(data: Dict[str, Any]) -> None:
 
 
 def _resolve_config_path(explicit: Optional[str]) -> str:
-    """按优先级找 config：参数 > 环境变量 > 本地配置 > 项目默认 > cwd。"""
+    """找到基础配置：参数 > 环境变量 > 项目默认 > cwd。"""
     candidates: List[str] = []
     if explicit:
         candidates.append(explicit)
@@ -225,7 +225,6 @@ def _resolve_config_path(explicit: Optional[str]) -> str:
     if env:
         candidates.append(env)
     root = _project_root()
-    candidates.append(os.path.join(root, "config", "config.local.yaml"))
     candidates.append(os.path.join(root, "config", "config.yaml"))
     candidates.append("config/config.yaml")
     for p in candidates:
@@ -234,11 +233,37 @@ def _resolve_config_path(explicit: Optional[str]) -> str:
     return candidates[-1]
 
 
-def default_config(config_path: Optional[str] = None) -> APIConfig:
-    """从 config.yaml 加载配置（与 Go 版 DefaultConfig 字段一一对齐）。"""
-    c = APIConfig()
+def _merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """递归合并本机覆盖配置，避免少量密钥覆盖整个基础配置。"""
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_config(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_config_data(config_path: Optional[str]) -> Dict[str, Any]:
+    """加载受版本控制的基础配置，并叠加不入库的本机配置。"""
     path = _resolve_config_path(config_path)
     data = _read_yaml(path)
+
+    # 显式传入路径主要用于测试或一次性运行，避免意外叠加工作区的本机密钥。
+    if config_path:
+        return data
+
+    local_path = os.path.join(_project_root(), "config", "config.local.yaml")
+    if os.path.isfile(local_path) and os.path.abspath(local_path) != os.path.abspath(path):
+        data = _merge_config(data, _read_yaml(local_path))
+    return data
+
+
+def default_config(config_path: Optional[str] = None) -> APIConfig:
+    """加载基础配置，并可叠加不入库的 config.local.yaml。"""
+    c = APIConfig()
+    data = _load_config_data(config_path)
     _validate_config_schema(data)
 
     if llm := data.get("llm"):
